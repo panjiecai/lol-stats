@@ -64,38 +64,18 @@ const mode = ref<FindMode>("anyFirstSame")
 const specificAugmentId = ref<number | null>(null)
 const augmentSearch = ref("")
 
-// —— 匹配位次（可多选）——
-// 键：'1'~'6' 表示第 1~6 个海克斯（绝对位次），'last' 表示「末位」（每人自己最后一个海克斯）。
-const SLOT_OPTIONS: Array<{ key: string; label: string }> = [
-  { key: "1", label: "第1" },
-  { key: "2", label: "第2" },
-  { key: "3", label: "第3" },
-  { key: "4", label: "第4" },
-  { key: "5", label: "第5" },
-  { key: "6", label: "第6" },
-  { key: "last", label: "末位" },
-]
-/** 默认仅第 1 个海克斯（等价于旧的「首个海克斯」行为）。 */
-const selectedSlots = ref<string[]>(["1"])
+// —— 匹配范围 ——
+// 'first' = 只比对每个人的「首个海克斯」（旧「首个连号」行为）；
+// 'all'   = 把同方所有队员全部位置的海克斯并到一起，同一个海克斯被 ≥2 名不同队员共同拥有即命中（不限次序）。
+type PosScope = "first" | "all"
+const posScope = ref<PosScope>("all")
 
-function isSlotActive(key: string) {
-  return selectedSlots.value.includes(key)
-}
-
-function toggleSlot(key: string) {
-  const has = selectedSlots.value.includes(key)
-  if (has && selectedSlots.value.length === 1) return // 至少保留一个位次
-  selectedSlots.value = has
-    ? selectedSlots.value.filter((item) => item !== key)
-    : [...selectedSlots.value, key]
-}
-
-/** 位次说明文案（用于 note/hint）。 */
-function slotDesc() {
-  const sel = selectedSlots.value
-  if (sel.length === 7) return "第 1~末 位"
-  const labels = sel.map((key) => (key === "last" ? "末位" : `第${key}位`))
-  return labels.join("、")
+function setPosScope(next: PosScope) {
+  if (scanning.value) return
+  posScope.value = next
+  results.value = []
+  activeGroupId.value = null
+  errorText.value = ""
 }
 
 const limit = ref(DEFAULT_LIMIT)
@@ -110,8 +90,6 @@ const errorText = ref("")
 type MatchHit = {
   game: RecentGame
   firstAugmentId: number
-  /** 命中的位次键：'1'~'6'=第N个海克斯；'last'=末位 */
-  slotKey: string
   /** 命中所在队伍名（蓝方/红方…） */
   teamName: string
   /** 是否命中在查询者自己那一方 */
@@ -275,25 +253,10 @@ function augmentName(augmentId: number) {
   return augmentMap.value[augmentId]?.name || `强化 ${augmentId}`
 }
 
-/** 命中的海克斯位次文案：'1'~'6'=第 N 个海克斯；'last'=末位。 */
-function slotText(slotKey: string) {
-  if (slotKey === "last") return "末位海克斯"
-  return `第 ${slotKey} 个海克斯`
-}
-
-function augmentAt(player: MatchDetailPlayer, position: number) {
-  return (player.augmentIds || [])[position] || 0
-}
-
-/** 某个玩家的「末位」海克斯（其 augIds 的最后一项）。 */
-function lastAugmentOf(player: MatchDetailPlayer) {
-  const ids = player.augmentIds || []
-  return ids.length ? ids[ids.length - 1] : 0
-}
-
-// 在每一方（蓝方/红方各自独立）里，按用户勾选的位次(slotKey)找出“≥2 名不同队员同一位次海克斯相同”。
-// slotKey '1'~'6' = 绝对第 N 个海克斯；'last' = 末位（每人各自最后一个）。
-// 注意：只在本方/对方各自内部比对，绝不跨队混算（用户明确要求“不是跨边”）。
+// 在每一方（蓝方/红方各自独立）里，找出“≥2 名不同队员共同拥有某个海克斯”的海克斯及其队员。
+// posScope=first：只看每人的首个海克斯（旧「首个连号」行为，等价“拥有者≥2且都在第1位”）。
+// posScope=all：把每人全部位置的海克斯并到一起统计——同一海克斯被 ≥2 名不同队员共同拥有即命中，不限它出现在第几位。
+// 注意：只在本方/对方各自内部比对，绝不跨队混算（“不是跨边”）。
 function evaluateDetail(detail: MatchDetailResponse, game: RecentGame) {
   const teams = detail?.teams || []
   const hits: MatchHit[] = []
@@ -304,11 +267,10 @@ function evaluateDetail(detail: MatchDetailResponse, game: RecentGame) {
 
     const isOwnerTeam = players.some((player) => player.puuid === ownerPuuid.value)
 
-    const pushHit = (augmentId: number, slotKey: string, mates: MatchDetailPlayer[]) => {
+    const pushHit = (augmentId: number, mates: MatchDetailPlayer[]) => {
       hits.push({
         game,
         firstAugmentId: augmentId,
-        slotKey,
         teamName: team.name || (isOwnerTeam ? "我方" : "对方"),
         isOwnerTeam,
         win: team.win,
@@ -320,42 +282,40 @@ function evaluateDetail(detail: MatchDetailResponse, game: RecentGame) {
       })
     }
 
-    const runSlot = (slotKey: string, valueOf: (player: MatchDetailPlayer) => number) => {
-      const group = new Map<number, MatchDetailPlayer[]>()
-      for (const player of players) {
-        const augId = valueOf(player)
+    // 统计该队内每个海克斯被哪些不同队员拥有（key=海克斯 id，value=队员列表，同一人只计一次）。
+    const group = new Map<number, MatchDetailPlayer[]>()
+    const seen = new Set<string>()
+    for (const player of players) {
+      const augIds = player.augmentIds || []
+      if (posScope.value === "first" && augIds.length) {
+        // 只看首个海克斯
+        seen.add(`${augIds[0]}:${player.puuid}`)
+        const first = augIds[0]
+        const list = group.get(first) || []
+        list.push(player)
+        group.set(first, list)
+        continue
+      }
+      for (const augId of augIds) {
         if (!augId) continue
+        const seenKey = `${augId}:${player.puuid}`
+        if (seen.has(seenKey)) continue
+        seen.add(seenKey)
         const list = group.get(augId) || []
         list.push(player)
         group.set(augId, list)
       }
-      if (mode.value === "specificAugment") {
-        const target = specificAugmentId.value
-        if (target) {
-          const list = group.get(target)
-          if (list && list.length >= 2) pushHit(target, slotKey, list)
-        }
-      } else {
-        for (const [augmentId, list] of group.entries()) {
-          if (list.length >= 2) pushHit(augmentId, slotKey, list)
-        }
+    }
+
+    if (mode.value === "specificAugment") {
+      const target = specificAugmentId.value
+      if (target) {
+        const list = group.get(target)
+        if (list && list.length >= 2) pushHit(target, list)
       }
-    }
-
-    // 队内海克斯数组最大长度，用于约束可用的绝对位次。
-    let maxCount = 0
-    for (const player of players) {
-      maxCount = Math.max(maxCount, (player.augmentIds || []).length)
-    }
-
-    // 每个勾选的绝对位次（'1'~'6' 且 ≤maxCount）跑一遍；末位单独跑一遍。
-    for (const opt of SLOT_OPTIONS) {
-      const key = opt.key
-      if (key === "last") {
-        if (isSlotActive("last")) runSlot("last", lastAugmentOf)
-      } else {
-        const n = Number(key)
-        if (isSlotActive(key) && n <= maxCount) runSlot(key, (p) => augmentAt(p, n - 1))
+    } else {
+      for (const [augmentId, list] of group.entries()) {
+        if (list.length >= 2) pushHit(augmentId, list)
       }
     }
   }
@@ -379,7 +339,10 @@ async function runScan() {
   activeGroupId.value = null
   errorText.value = ""
   progress.value = { done: 0, total: games.length, matched: 0 }
-  statusMessage.value = `正在逐局读取对局详情，比对双方位次 ${slotDesc()} 的海克斯…`
+  statusMessage.value =
+    posScope.value === "all"
+      ? "正在逐局读取对局详情，找同方 ≥2 名队员共同拥有的海克斯（不限位次）…"
+      : "正在逐局读取对局详情，找同方 ≥2 名队员首个海克斯相同的对局…"
 
   let index = 0
   const matched: MatchHit[] = []
@@ -417,7 +380,7 @@ async function runScan() {
   const uniqueByGame = new Map<string, MatchHit>()
   for (const hit of matched)
     uniqueByGame.set(
-      `${hit.game.gameId}:${hit.teamName}:${hit.firstAugmentId}:${hit.slotKey}`,
+      `${hit.game.gameId}:${hit.teamName}:${hit.firstAugmentId}`,
       hit,
     )
   results.value = Array.from(uniqueByGame.values())
@@ -427,7 +390,7 @@ async function runScan() {
     notify({
       kind: "success",
       title: "海克斯连号检索完成",
-      message: `共命中 ${results.value.length} 处，双方各自满足「同方 ≥2 人 ${scopeLabel()}相同」`,
+      message: `共命中 ${results.value.length} 处，判定：${summaryPrefix()}`,
     })
   } else {
     statusMessage.value = errorText.value
@@ -437,7 +400,7 @@ async function runScan() {
       notify({
         kind: "info",
         title: "没有命中",
-        message: `在最近 ${effectiveLimit.value} 局海克斯对局中，我方与对方均未出现同方 ≥2 人${scopeLabel()}相同`,
+        message: `在最近 ${effectiveLimit.value} 局海克斯对局中，未出现满足「${summaryPrefix()}」的命中`,
       })
     }
   }
@@ -476,19 +439,17 @@ function openHit(hit: MatchHit) {
   })
 }
 
-/** 匹配位次的描述（如「第1、第3位」），用于说明当前判据。 */
-function scopeLabel() {
-  const sel = selectedSlots.value
-  if (sel.length === SLOT_OPTIONS.length) return "第 1~末 位海克斯"
-  if (sel.length === 1) return sel[0] === "1" ? "仅首个海克斯" : `${sel[0] === "last" ? "末位" : `第${sel[0]}个`}海克斯`
-  return `${sel.map((key) => (key === "last" ? "末位" : `第${key}个`)).join("、")}海克斯`
-}
-
+/** 匹配判据的一句自然描述，用于检索说明。 */
 function summaryPrefix() {
-  const positionClause = scopeLabel()
-  return mode.value === "specificAugment"
-    ? `${positionClause} = ${augmentName(specificAugmentId.value || 0)}`
-    : `${positionClause}相同`
+  if (mode.value === "specificAugment") {
+    const name = augmentName(specificAugmentId.value || 0)
+    return posScope.value === "all"
+      ? `${name} 被同方 ≥2 名队员共同拥有（不限位次）`
+      : `${name} 被同方 ≥2 名队员作为首个海克斯共同拥有`
+  }
+  return posScope.value === "all"
+    ? "同一海克斯被同方 ≥2 名队员共同拥有（不限位次）"
+    : "同一海克斯被同方 ≥2 名队员作为首个海克斯共同拥有"
 }
 
 function dateText(timestamp: number) {
@@ -506,7 +467,7 @@ function winClass(win: boolean) {
       <div class="combo-title">
         <Sparkles :size="16" />
         <strong>海克斯连号检索</strong>
-        <span>逐局读取详情，分别检查我方、对方（同方内）同一位次上 ≥2 人海克斯相同的对局</span>
+        <span>逐局读取详情，分别检查我方、对方（同方内）≥2 名队员共同拥有同一海克斯的对局</span>
       </div>
     </div>
 
@@ -531,20 +492,32 @@ function winClass(win: boolean) {
       </div>
 
       <div class="pos-scope-row">
-        <label>匹配位次</label>
-        <div class="pos-scope-switch" role="group" aria-label="匹配海克斯位次">
+        <label>匹配范围</label>
+        <div class="pos-scope-switch" role="group" aria-label="匹配范围">
           <button
-            v-for="opt in SLOT_OPTIONS"
-            :key="opt.key"
             type="button"
-            :class="{ active: isSlotActive(opt.key) }"
+            :class="{ active: posScope === 'all' }"
             :disabled="scanning"
-            @click="toggleSlot(opt.key)"
+            @click="setPosScope('all')"
           >
-            {{ opt.label }}
+            全部海克斯·不限次序
+          </button>
+          <button
+            type="button"
+            :class="{ active: posScope === 'first' }"
+            :disabled="scanning"
+            @click="setPosScope('first')"
+          >
+            仅首个海克斯
           </button>
         </div>
-        <span class="pos-scope-hint">多选位次，同一位次同方 ≥2 人海克斯相同即命中（{{ slotDesc() }}）</span>
+        <span class="pos-scope-hint">
+          {{
+            posScope === "all"
+              ? "同一边内，任一海克斯被 ≥2 名队员共同拥有即命中（不管在第几位）"
+              : "同一边内，≥2 名队员首个海克斯相同即命中"
+          }}
+        </span>
       </div>
 
       <div class="augment-picker" v-if="mode === 'specificAugment'">
@@ -660,7 +633,7 @@ function winClass(win: boolean) {
         <div class="result-list">
           <button
             v-for="hit in activeGroupHits"
-            :key="`${hit.game.gameId}:${hit.teamName}:${hit.firstAugmentId}:${hit.slotKey}`"
+            :key="`${hit.game.gameId}:${hit.teamName}:${hit.firstAugmentId}`"
             class="result-row"
             type="button"
             :title="`打开对局 ${hit.game.gameId}`"
@@ -685,7 +658,8 @@ function winClass(win: boolean) {
               <div class="result-augment">
                 <span class="rarity-dot" :class="rarityClass(augmentMap[hit.firstAugmentId]?.rarity)"></span>
                 <strong>{{ augmentName(hit.firstAugmentId) }}</strong>
-                <span class="pos-chip">{{ slotText(hit.slotKey) }}</span>
+                <span class="pos-chip" v-if="posScope === 'first'">首个海克斯</span>
+                <span class="pos-chip" v-else>不限位次</span>
                 <span>{{ hit.isOwnerTeam ? "我方" : "对方" }} {{ hit.teammates.length }} 名队员持有：</span>
               </div>
               <div class="result-players">
@@ -707,7 +681,7 @@ function winClass(win: boolean) {
       <!-- 汇总视图：按海克斯类型统计命中方的胜负胜率 -->
       <template v-else>
         <div class="result-note">
-          命中 <strong>{{ results.length }}</strong> 处（<strong>{{ augmentGroups.length }}</strong> 种海克斯）——我方与对方分开检查，仅同方内、同一位次上比对（不跨边、不对齐不同位次），匹配条件：{{ summaryPrefix() }}。胜率统计的是「拥有该海克斯的那支队伍」的胜负（非账号那一方），点击海克斯查看其下全部对局。
+          命中 <strong>{{ results.length }}</strong> 处（<strong>{{ augmentGroups.length }}</strong> 种海克斯）——我方与对方分开检查，仅同方内比对（不跨边）。判定：{{ summaryPrefix() }}。胜率统计的是「拥有该海克斯的那支队伍」的胜负（非账号那一方），点击海克斯查看其下全部对局。
         </div>
         <div class="summary-sort-row">
           <span>排序</span>
