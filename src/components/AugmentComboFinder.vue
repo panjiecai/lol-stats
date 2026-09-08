@@ -63,6 +63,41 @@ const ownerPuuid = computed(() => props.stats?.summoner.puuid || "")
 const mode = ref<FindMode>("anyFirstSame")
 const specificAugmentId = ref<number | null>(null)
 const augmentSearch = ref("")
+
+// —— 匹配位次（可多选）——
+// 键：'1'~'6' 表示第 1~6 个海克斯（绝对位次），'last' 表示「末位」（每人自己最后一个海克斯）。
+const SLOT_OPTIONS: Array<{ key: string; label: string }> = [
+  { key: "1", label: "第1" },
+  { key: "2", label: "第2" },
+  { key: "3", label: "第3" },
+  { key: "4", label: "第4" },
+  { key: "5", label: "第5" },
+  { key: "6", label: "第6" },
+  { key: "last", label: "末位" },
+]
+/** 默认仅第 1 个海克斯（等价于旧的「首个海克斯」行为）。 */
+const selectedSlots = ref<string[]>(["1"])
+
+function isSlotActive(key: string) {
+  return selectedSlots.value.includes(key)
+}
+
+function toggleSlot(key: string) {
+  const has = selectedSlots.value.includes(key)
+  if (has && selectedSlots.value.length === 1) return // 至少保留一个位次
+  selectedSlots.value = has
+    ? selectedSlots.value.filter((item) => item !== key)
+    : [...selectedSlots.value, key]
+}
+
+/** 位次说明文案（用于 note/hint）。 */
+function slotDesc() {
+  const sel = selectedSlots.value
+  if (sel.length === 7) return "第 1~末 位"
+  const labels = sel.map((key) => (key === "last" ? "末位" : `第${key}位`))
+  return labels.join("、")
+}
+
 const limit = ref(DEFAULT_LIMIT)
 const limitOpen = ref(false)
 
@@ -75,6 +110,8 @@ const errorText = ref("")
 type MatchHit = {
   game: RecentGame
   firstAugmentId: number
+  /** 命中的位次键：'1'~'6'=第N个海克斯；'last'=末位 */
+  slotKey: string
   /** 命中所在队伍名（蓝方/红方…） */
   teamName: string
   /** 是否命中在查询者自己那一方 */
@@ -129,7 +166,11 @@ const canRun = computed(() => {
 
 const effectiveLimit = computed(() => Math.min(limit.value, candidateGames.value.length))
 
-/** 把命中按「海克斯类型」汇总，按胜率降序（同胜率时命中数多者优先）。 */
+/** 汇总视图排序维度：按胜率 or 按对局数（均降序）。 */
+type SortMode = "winRate" | "games"
+const sortBy = ref<SortMode>("winRate")
+
+/** 把命中按「海克斯类型」汇总，按当前 sortBy 降序（次关键字对局数/名称稳定）。 */
 const augmentGroups = computed<AugmentGroup[]>(() => {
   const byId = new Map<number, MatchHit[]>()
   for (const hit of results.value) {
@@ -152,9 +193,14 @@ const augmentGroups = computed<AugmentGroup[]>(() => {
       hits,
     })
   }
-  groups.sort(
-    (a, b) => b.winRate - a.winRate || b.games - a.games || a.name.localeCompare(b.name, "zh-CN"),
-  )
+  groups.sort((a, b) => {
+    const primary =
+      sortBy.value === "winRate"
+        ? b.winRate - a.winRate
+        : b.games - a.games
+    if (primary !== 0) return primary
+    return b.games - a.games || a.name.localeCompare(b.name, "zh-CN")
+  })
   return groups
 })
 
@@ -229,11 +275,24 @@ function augmentName(augmentId: number) {
   return augmentMap.value[augmentId]?.name || `强化 ${augmentId}`
 }
 
-function firstAugmentOf(player: MatchDetailPlayer) {
-  return (player.augmentIds || [])[0] || 0
+/** 命中的海克斯位次文案：'1'~'6'=第 N 个海克斯；'last'=末位。 */
+function slotText(slotKey: string) {
+  if (slotKey === "last") return "末位海克斯"
+  return `第 ${slotKey} 个海克斯`
 }
 
-// 在每一方（蓝方/红方各自独立）里，找出所有“≥2 名不同队员首个海克斯相同”的海克斯及其队员。
+function augmentAt(player: MatchDetailPlayer, position: number) {
+  return (player.augmentIds || [])[position] || 0
+}
+
+/** 某个玩家的「末位」海克斯（其 augIds 的最后一项）。 */
+function lastAugmentOf(player: MatchDetailPlayer) {
+  const ids = player.augmentIds || []
+  return ids.length ? ids[ids.length - 1] : 0
+}
+
+// 在每一方（蓝方/红方各自独立）里，按用户勾选的位次(slotKey)找出“≥2 名不同队员同一位次海克斯相同”。
+// slotKey '1'~'6' = 绝对第 N 个海克斯；'last' = 末位（每人各自最后一个）。
 // 注意：只在本方/对方各自内部比对，绝不跨队混算（用户明确要求“不是跨边”）。
 function evaluateDetail(detail: MatchDetailResponse, game: RecentGame) {
   const teams = detail?.teams || []
@@ -245,19 +304,11 @@ function evaluateDetail(detail: MatchDetailResponse, game: RecentGame) {
 
     const isOwnerTeam = players.some((player) => player.puuid === ownerPuuid.value)
 
-    const group = new Map<number, MatchDetailPlayer[]>()
-    for (const player of players) {
-      const first = firstAugmentOf(player)
-      if (!first) continue
-      const list = group.get(first) || []
-      list.push(player)
-      group.set(first, list)
-    }
-
-    const pushHit = (firstAugmentId: number, mates: MatchDetailPlayer[]) => {
+    const pushHit = (augmentId: number, slotKey: string, mates: MatchDetailPlayer[]) => {
       hits.push({
         game,
-        firstAugmentId,
+        firstAugmentId: augmentId,
+        slotKey,
         teamName: team.name || (isOwnerTeam ? "我方" : "对方"),
         isOwnerTeam,
         win: team.win,
@@ -269,19 +320,42 @@ function evaluateDetail(detail: MatchDetailResponse, game: RecentGame) {
       })
     }
 
-    if (mode.value === "specificAugment") {
-      const target = specificAugmentId.value
-      if (target) {
-        const list = group.get(target)
-        if (list && list.length >= 2) {
-          pushHit(target, list)
+    const runSlot = (slotKey: string, valueOf: (player: MatchDetailPlayer) => number) => {
+      const group = new Map<number, MatchDetailPlayer[]>()
+      for (const player of players) {
+        const augId = valueOf(player)
+        if (!augId) continue
+        const list = group.get(augId) || []
+        list.push(player)
+        group.set(augId, list)
+      }
+      if (mode.value === "specificAugment") {
+        const target = specificAugmentId.value
+        if (target) {
+          const list = group.get(target)
+          if (list && list.length >= 2) pushHit(target, slotKey, list)
+        }
+      } else {
+        for (const [augmentId, list] of group.entries()) {
+          if (list.length >= 2) pushHit(augmentId, slotKey, list)
         }
       }
-    } else {
-      for (const [augmentId, list] of group.entries()) {
-        if (list.length >= 2) {
-          pushHit(augmentId, list)
-        }
+    }
+
+    // 队内海克斯数组最大长度，用于约束可用的绝对位次。
+    let maxCount = 0
+    for (const player of players) {
+      maxCount = Math.max(maxCount, (player.augmentIds || []).length)
+    }
+
+    // 每个勾选的绝对位次（'1'~'6' 且 ≤maxCount）跑一遍；末位单独跑一遍。
+    for (const opt of SLOT_OPTIONS) {
+      const key = opt.key
+      if (key === "last") {
+        if (isSlotActive("last")) runSlot("last", lastAugmentOf)
+      } else {
+        const n = Number(key)
+        if (isSlotActive(key) && n <= maxCount) runSlot(key, (p) => augmentAt(p, n - 1))
       }
     }
   }
@@ -305,7 +379,7 @@ async function runScan() {
   activeGroupId.value = null
   errorText.value = ""
   progress.value = { done: 0, total: games.length, matched: 0 }
-  statusMessage.value = "正在逐局读取对局详情，分别比对双方首个海克斯…"
+  statusMessage.value = `正在逐局读取对局详情，比对双方位次 ${slotDesc()} 的海克斯…`
 
   let index = 0
   const matched: MatchHit[] = []
@@ -342,7 +416,10 @@ async function runScan() {
 
   const uniqueByGame = new Map<string, MatchHit>()
   for (const hit of matched)
-    uniqueByGame.set(`${hit.game.gameId}:${hit.teamName}:${hit.firstAugmentId}`, hit)
+    uniqueByGame.set(
+      `${hit.game.gameId}:${hit.teamName}:${hit.firstAugmentId}:${hit.slotKey}`,
+      hit,
+    )
   results.value = Array.from(uniqueByGame.values())
 
   if (results.value.length) {
@@ -350,7 +427,7 @@ async function runScan() {
     notify({
       kind: "success",
       title: "海克斯连号检索完成",
-      message: `共命中 ${results.value.length} 处，双方各自满足「同方 ≥2 人首个海克斯相同」`,
+      message: `共命中 ${results.value.length} 处，双方各自满足「同方 ≥2 人 ${scopeLabel()}相同」`,
     })
   } else {
     statusMessage.value = errorText.value
@@ -360,7 +437,7 @@ async function runScan() {
       notify({
         kind: "info",
         title: "没有命中",
-        message: `在最近 ${effectiveLimit.value} 局海克斯对局中，我方与对方均未出现同方 ≥2 人首个海克斯相同`,
+        message: `在最近 ${effectiveLimit.value} 局海克斯对局中，我方与对方均未出现同方 ≥2 人${scopeLabel()}相同`,
       })
     }
   }
@@ -399,10 +476,19 @@ function openHit(hit: MatchHit) {
   })
 }
 
+/** 匹配位次的描述（如「第1、第3位」），用于说明当前判据。 */
+function scopeLabel() {
+  const sel = selectedSlots.value
+  if (sel.length === SLOT_OPTIONS.length) return "第 1~末 位海克斯"
+  if (sel.length === 1) return sel[0] === "1" ? "仅首个海克斯" : `${sel[0] === "last" ? "末位" : `第${sel[0]}个`}海克斯`
+  return `${sel.map((key) => (key === "last" ? "末位" : `第${key}个`)).join("、")}海克斯`
+}
+
 function summaryPrefix() {
+  const positionClause = scopeLabel()
   return mode.value === "specificAugment"
-    ? `首个海克斯 = ${augmentName(specificAugmentId.value || 0)}`
-    : "首个海克斯相同"
+    ? `${positionClause} = ${augmentName(specificAugmentId.value || 0)}`
+    : `${positionClause}相同`
 }
 
 function dateText(timestamp: number) {
@@ -420,7 +506,7 @@ function winClass(win: boolean) {
       <div class="combo-title">
         <Sparkles :size="16" />
         <strong>海克斯连号检索</strong>
-        <span>逐局读取详情，分别检查我方、对方（同方内）≥2 人首个海克斯相同的对局</span>
+        <span>逐局读取详情，分别检查我方、对方（同方内）同一位次上 ≥2 人海克斯相同的对局</span>
       </div>
     </div>
 
@@ -442,6 +528,23 @@ function winClass(win: boolean) {
         >
           指定海克斯
         </button>
+      </div>
+
+      <div class="pos-scope-row">
+        <label>匹配位次</label>
+        <div class="pos-scope-switch" role="group" aria-label="匹配海克斯位次">
+          <button
+            v-for="opt in SLOT_OPTIONS"
+            :key="opt.key"
+            type="button"
+            :class="{ active: isSlotActive(opt.key) }"
+            :disabled="scanning"
+            @click="toggleSlot(opt.key)"
+          >
+            {{ opt.label }}
+          </button>
+        </div>
+        <span class="pos-scope-hint">多选位次，同一位次同方 ≥2 人海克斯相同即命中（{{ slotDesc() }}）</span>
       </div>
 
       <div class="augment-picker" v-if="mode === 'specificAugment'">
@@ -552,12 +655,12 @@ function winClass(win: boolean) {
           <button type="button" class="back-button" @click="backToSummary">‹ 返回海克斯汇总</button>
           <span class="rarity-dot" :class="rarityClass(activeGroup.rarity)"></span>
           <strong>{{ activeGroup.name }}</strong>
-          命中 {{ activeGroup.games }} 处，胜率 {{ activeGroup.winRate.toFixed(0) }}%（{{ activeGroup.wins }} 胜 {{ activeGroup.losses }} 负）。点击对局可打开完整详情。
+          命中 {{ activeGroup.games }} 处，胜率 {{ activeGroup.winRate.toFixed(0) }}%（{{ activeGroup.wins }} 胜 {{ activeGroup.losses }} 负）——胜率指「该海克斯所在队伍」的胜率。点击对局可打开完整详情。
         </div>
         <div class="result-list">
           <button
             v-for="hit in activeGroupHits"
-            :key="`${hit.game.gameId}:${hit.teamName}:${hit.firstAugmentId}`"
+            :key="`${hit.game.gameId}:${hit.teamName}:${hit.firstAugmentId}:${hit.slotKey}`"
             class="result-row"
             type="button"
             :title="`打开对局 ${hit.game.gameId}`"
@@ -582,7 +685,8 @@ function winClass(win: boolean) {
               <div class="result-augment">
                 <span class="rarity-dot" :class="rarityClass(augmentMap[hit.firstAugmentId]?.rarity)"></span>
                 <strong>{{ augmentName(hit.firstAugmentId) }}</strong>
-                <span>作为{{ hit.isOwnerTeam ? "我方" : "对方" }}首个海克斯的队员（{{ hit.teammates.length }} 人）：</span>
+                <span class="pos-chip">{{ slotText(hit.slotKey) }}</span>
+                <span>{{ hit.isOwnerTeam ? "我方" : "对方" }} {{ hit.teammates.length }} 名队员持有：</span>
               </div>
               <div class="result-players">
                 <span
@@ -603,7 +707,27 @@ function winClass(win: boolean) {
       <!-- 汇总视图：按海克斯类型统计命中方的胜负胜率 -->
       <template v-else>
         <div class="result-note">
-          命中 <strong>{{ results.length }}</strong> 处（<strong>{{ augmentGroups.length }}</strong> 种海克斯）——我方与对方分开检查，仅同方内比对（不跨边），{{ summaryPrefix() }}。按命中那方的实际胜负统计胜率，点击海克斯查看其下全部对局。
+          命中 <strong>{{ results.length }}</strong> 处（<strong>{{ augmentGroups.length }}</strong> 种海克斯）——我方与对方分开检查，仅同方内、同一位次上比对（不跨边、不对齐不同位次），匹配条件：{{ summaryPrefix() }}。胜率统计的是「拥有该海克斯的那支队伍」的胜负（非账号那一方），点击海克斯查看其下全部对局。
+        </div>
+        <div class="summary-sort-row">
+          <span>排序</span>
+          <div class="summary-sort-switch" role="group" aria-label="汇总排序方式">
+            <button
+              type="button"
+              :class="{ active: sortBy === 'winRate' }"
+              @click="sortBy = 'winRate'"
+            >
+              胜率
+            </button>
+            <button
+              type="button"
+              :class="{ active: sortBy === 'games' }"
+              @click="sortBy = 'games'"
+            >
+              对局数
+            </button>
+          </div>
+          <span class="sort-hint">{{ sortBy === "winRate" ? "按胜率从高到低" : "按对局数从多到少" }}</span>
         </div>
         <div class="augment-summary-list">
           <button
@@ -696,6 +820,54 @@ function winClass(win: boolean) {
 .mode-switch button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.pos-scope-row {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #53666c;
+}
+
+.pos-scope-row label {
+  font-weight: 700;
+}
+
+.pos-scope-switch {
+  display: inline-flex;
+  gap: 4px;
+  border: 1px solid #dce7e4;
+  border-radius: 999px;
+  background: #f5f9f8;
+  padding: 2px;
+}
+
+.pos-scope-switch button {
+  border: 0;
+  border-radius: 999px;
+  color: #53666c;
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 12px;
+}
+
+.pos-scope-switch button.active {
+  color: #ffffff;
+  background: #1f5f56;
+}
+
+.pos-scope-switch button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.pos-scope-hint {
+  color: #8a9a9f;
+  font-size: 12px;
 }
 
 .augment-picker {
@@ -987,6 +1159,44 @@ function winClass(win: boolean) {
   background: #eef6f3;
 }
 
+.summary-sort-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #718087;
+}
+
+.summary-sort-switch {
+  display: inline-flex;
+  gap: 4px;
+  border: 1px solid #dce7e4;
+  border-radius: 8px;
+  background: #f5f9f8;
+  padding: 2px;
+}
+
+.summary-sort-switch button {
+  border: 0;
+  border-radius: 6px;
+  color: #53666c;
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 3px 12px;
+}
+
+.summary-sort-switch button.active {
+  color: #1f5f56;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(32, 67, 73, 0.12);
+}
+
+.sort-hint {
+  color: #8a9a9f;
+}
+
 .augment-summary-list {
   display: flex;
   flex-direction: column;
@@ -1187,6 +1397,18 @@ function winClass(win: boolean) {
   color: #1f5f56;
   font-size: 13px;
   font-weight: 900;
+}
+
+.pos-chip {
+  flex: 0 0 auto;
+  border: 1px solid #dce7e4;
+  border-radius: 999px;
+  color: #53666c;
+  background: #f2f7f5;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 8px;
+  white-space: nowrap;
 }
 
 .result-players {
