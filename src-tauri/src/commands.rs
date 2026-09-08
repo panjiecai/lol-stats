@@ -3,23 +3,31 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{async_runtime, AppHandle, Emitter};
 
 use crate::services::client_discovery::discover_primary_client;
 use crate::services::error::{AppError, AppResult};
 use crate::services::lcu::{LcuClient, RiotClient};
 use crate::services::models::{
-    ChampSelectPlayer, ChampionSummaryItem, ChatMe, ClientAuth, ConnectionStatus, FriendToolEntry,
-    GameAssetBundle, GameflowPlayer, GameflowSession, LiveGameResponse, LivePlayer,
-    LivePremadeMarker, LiveTeam, MatchDetailResponse, PlayerEloEstimateResponse,
-    PlayerEloEstimateTaskStatus, PlayerStatsResponse, PlayerSummary, RankedQueueEntry,
+    ChampSelectPlayer, ChampionSummaryItem, ChatMe, ClientAuth, ConnectionStatus,
+    ExternalEloLookupDebugResponse, FriendToolEntry, GameAssetBundle, GameflowPlayer,
+    GameflowSession, LiveGameResponse, LivePlayer, LivePremadeMarker, LiveTeam,
+    MatchDetailResponse, OfficialApiDebugResponse, PersistedPlayerEloTaskRecord,
+    PlayerActiveGame, PlayerEloEstimateResponse, PlayerEloEstimateTaskStatus, PlayerEloQueueItem,
+    PlayerEloQueueSnapshot, PlayerStatsResponse, PlayerSummary, RankedQueueEntry,
     RankedStatsResponse, RecentGame, SafeClientInfo, SummonerInfo, SummonerSearchCandidate,
 };
+use crate::services::sgp::{
+    debug_official_api_probe, normalize_sgp_server_id, resolve_sgp_server_id,
+};
 use crate::services::stats::{
-    clear_player_elo_cache as clear_player_elo_cache_service, estimate_player_elo,
-    load_cached_player_elo, load_match_detail as load_match_detail_service, load_player_stats,
-    load_player_stats_with_progress, normalize_depth,
+    clear_player_elo_cache as clear_player_elo_cache_service, debug_external_elo_lookup,
+    delete_duplicate_player_elo_jobs as delete_duplicate_player_elo_jobs_service,
+    estimate_player_elo, estimate_player_elo_with_progress, load_cached_player_elo,
+    load_last_player_elo, load_match_detail as load_match_detail_service, load_player_elo_jobs,
+    load_player_stats, load_player_stats_with_progress, normalize_depth, probe_player_external_elo,
+    prune_player_elo_job_history, read_player_elo_job, write_player_elo_job,
 };
 use crate::services::tools::{
     game_settings_locked, set_game_settings_locked as set_settings_locked,
@@ -54,6 +62,8 @@ static PLAYER_ELO_JOBS: LazyLock<Mutex<HashMap<String, PlayerEloTaskEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const PLAYER_ELO_JOB_RETENTION: Duration = Duration::from_secs(10 * 60);
+const PLAYER_ELO_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+const PLAYER_ELO_RESTORE_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,9 +74,33 @@ struct StatsLoadProgress {
 }
 
 #[derive(Clone)]
+struct PlayerEloTaskMeta {
+    puuid: String,
+    game_name: String,
+    tag_line: String,
+    display_name: String,
+    riot_id: String,
+    sgp_server_id: String,
+}
+
+impl Default for PlayerEloTaskMeta {
+    fn default() -> Self {
+        Self {
+            puuid: String::new(),
+            game_name: String::new(),
+            tag_line: String::new(),
+            display_name: String::new(),
+            riot_id: String::new(),
+            sgp_server_id: String::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct PlayerEloTaskEntry {
     status: PlayerEloEstimateTaskStatus,
     updated_at: Instant,
+    meta: PlayerEloTaskMeta,
 }
 
 #[derive(Clone, Serialize)]
@@ -137,7 +171,10 @@ fn build_player_elo_summoner(
 }
 
 fn player_elo_job_id(summoner: &SummonerInfo, sgp_server_id: Option<&str>) -> String {
-    let server = sgp_server_id.unwrap_or("unknown").trim();
+    let server = sgp_server_id
+        .filter(|value| !value.trim().is_empty())
+        .map(normalize_sgp_server_id)
+        .unwrap_or_else(|| "unknown".to_string());
     format!("{}:{}", server, summoner.puuid.trim())
 }
 
@@ -146,23 +183,554 @@ fn prune_player_elo_jobs() {
         let now = Instant::now();
         jobs.retain(|_, entry| now.duration_since(entry.updated_at) <= PLAYER_ELO_JOB_RETENTION);
     }
+
+    prune_player_elo_job_history();
+}
+
+fn instant_from_updated_at_ms(updated_at_ms: i64) -> Instant {
+    let age_ms = current_unix_ms().saturating_sub(updated_at_ms).max(0);
+    let age = Duration::from_millis(age_ms.try_into().unwrap_or_default());
+    Instant::now().checked_sub(age).unwrap_or_else(Instant::now)
+}
+
+fn player_elo_task_entry_from_record(record: &PersistedPlayerEloTaskRecord) -> PlayerEloTaskEntry {
+    PlayerEloTaskEntry {
+        status: record.status.clone(),
+        updated_at: instant_from_updated_at_ms(record.updated_at_ms),
+        meta: PlayerEloTaskMeta {
+            puuid: record.puuid.clone(),
+            game_name: record.game_name.clone(),
+            tag_line: record.tag_line.clone(),
+            display_name: record.display_name.clone(),
+            riot_id: record.riot_id.clone(),
+            sgp_server_id: record.sgp_server_id.clone(),
+        },
+    }
+}
+
+fn persisted_player_elo_record(
+    status: &PlayerEloEstimateTaskStatus,
+    meta: &PlayerEloTaskMeta,
+    updated_at_ms: i64,
+) -> PersistedPlayerEloTaskRecord {
+    PersistedPlayerEloTaskRecord {
+        job_id: status.job_id.clone(),
+        puuid: meta.puuid.clone(),
+        game_name: meta.game_name.clone(),
+        tag_line: meta.tag_line.clone(),
+        display_name: meta.display_name.clone(),
+        riot_id: meta.riot_id.clone(),
+        sgp_server_id: meta.sgp_server_id.clone(),
+        updated_at_ms,
+        status: status.clone(),
+    }
 }
 
 fn snapshot_player_elo_job(job_id: &str) -> Option<PlayerEloEstimateTaskStatus> {
-    PLAYER_ELO_JOBS
+    if let Some(status) = PLAYER_ELO_JOBS
         .lock()
         .ok()
         .and_then(|jobs| jobs.get(job_id).map(|entry| entry.status.clone()))
+    {
+        return Some(status);
+    }
+
+    let record = read_player_elo_job(job_id)?;
+    let entry = player_elo_task_entry_from_record(&record);
+    let status = entry.status.clone();
+    if let Ok(mut jobs) = PLAYER_ELO_JOBS.lock() {
+        jobs.insert(job_id.to_string(), entry);
+    }
+    Some(status)
 }
 
-fn store_player_elo_job(status: PlayerEloEstimateTaskStatus) {
-    if let Ok(mut jobs) = PLAYER_ELO_JOBS.lock() {
+fn current_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn player_elo_task_meta(summoner: &SummonerInfo, sgp_server_id: &str) -> PlayerEloTaskMeta {
+    PlayerEloTaskMeta {
+        puuid: summoner.puuid.trim().to_string(),
+        game_name: summoner.game_name.trim().to_string(),
+        tag_line: summoner.tag_line.trim().to_string(),
+        display_name: summoner.display_name.trim().to_string(),
+        riot_id: summoner.riot_id(),
+        sgp_server_id: normalize_sgp_server_id(sgp_server_id),
+    }
+}
+
+fn player_elo_queue_item(entry: &PlayerEloTaskEntry, now_ms: i64) -> PlayerEloQueueItem {
+    PlayerEloQueueItem {
+        job_id: entry.status.job_id.clone(),
+        display_name: entry.meta.display_name.clone(),
+        riot_id: entry.meta.riot_id.clone(),
+        sgp_server_id: entry.meta.sgp_server_id.clone(),
+        status: entry.status.status.clone(),
+        message: entry.status.message.clone(),
+        next_poll_delay_ms: entry.status.next_poll_delay_ms,
+        updated_at_ms: now_ms.saturating_sub(entry.updated_at.elapsed().as_millis() as i64),
+        current_elo: entry.status.result.as_ref().and_then(|result| {
+            if result.sample_games > 0 || result.final_elo > 0.0 {
+                Some(result.final_elo)
+            } else {
+                None
+            }
+        }),
+        sample_games: entry
+            .status
+            .result
+            .as_ref()
+            .map(|result| result.sample_games)
+            .unwrap_or_default(),
+    }
+}
+
+fn player_elo_queue_snapshot() -> PlayerEloQueueSnapshot {
+    prune_player_elo_jobs();
+    let now_ms = current_unix_ms();
+    let mut merged_items = BTreeMap::new();
+
+    for record in load_player_elo_jobs() {
+        let entry = player_elo_task_entry_from_record(&record);
+        merged_items.insert(record.job_id, player_elo_queue_item(&entry, now_ms));
+    }
+
+    if let Ok(jobs) = PLAYER_ELO_JOBS.lock() {
+        for entry in jobs.values() {
+            merged_items.insert(
+                entry.status.job_id.clone(),
+                player_elo_queue_item(entry, now_ms),
+            );
+        }
+    }
+
+    let mut active_items = Vec::new();
+    let mut history_items = Vec::new();
+    for item in merged_items.into_values() {
+        if matches!(item.status.as_str(), "pending" | "running" | "retrying") {
+            active_items.push(item);
+        } else if matches!(item.status.as_str(), "completed" | "failed") {
+            history_items.push(item);
+        }
+    }
+
+    active_items.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+    history_items.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+    history_items.truncate(12);
+
+    PlayerEloQueueSnapshot {
+        active_items,
+        history_items,
+    }
+}
+
+fn store_player_elo_job(status: PlayerEloEstimateTaskStatus, meta: Option<&PlayerEloTaskMeta>) {
+    let updated_at_ms = current_unix_ms();
+    let persisted = if let Ok(mut jobs) = PLAYER_ELO_JOBS.lock() {
+        let preserved_meta = jobs
+            .get(&status.job_id)
+            .map(|entry| entry.meta.clone())
+            .unwrap_or_default();
+        let resolved_meta = meta.cloned().unwrap_or(preserved_meta);
         jobs.insert(
             status.job_id.clone(),
             PlayerEloTaskEntry {
-                status,
+                status: status.clone(),
                 updated_at: Instant::now(),
+                meta: resolved_meta.clone(),
             },
+        );
+        Some(persisted_player_elo_record(
+            &status,
+            &resolved_meta,
+            updated_at_ms,
+        ))
+    } else {
+        meta.map(|resolved_meta| persisted_player_elo_record(&status, resolved_meta, updated_at_ms))
+    };
+
+    if let Some(record) = persisted {
+        write_player_elo_job(&record);
+    }
+}
+
+fn try_claim_player_elo_job(
+    status: PlayerEloEstimateTaskStatus,
+    meta: &PlayerEloTaskMeta,
+) -> Result<PlayerEloEstimateTaskStatus, PlayerEloEstimateTaskStatus> {
+    if let Ok(mut jobs) = PLAYER_ELO_JOBS.lock() {
+        if let Some(existing) = jobs.get(&status.job_id).map(|entry| entry.status.clone()) {
+            if matches!(existing.status.as_str(), "pending" | "running" | "retrying") {
+                return Err(existing);
+            }
+        }
+
+        jobs.insert(
+            status.job_id.clone(),
+            PlayerEloTaskEntry {
+                status: status.clone(),
+                updated_at: Instant::now(),
+                meta: meta.clone(),
+            },
+        );
+    } else if let Some(record) = read_player_elo_job(&status.job_id) {
+        if matches!(
+            record.status.status.as_str(),
+            "pending" | "running" | "retrying"
+        ) {
+            return Err(record.status);
+        }
+    }
+
+    write_player_elo_job(&persisted_player_elo_record(&status, meta, current_unix_ms()));
+    Ok(status)
+}
+
+fn purge_duplicate_player_elo_jobs(
+    puuid: &str,
+    canonical_job_id: &str,
+    canonical_sgp_server_id: &str,
+) {
+    let normalized_puuid = puuid.trim();
+    let canonical_job_id = canonical_job_id.trim();
+    let legacy_unknown_job_id = format!("unknown:{normalized_puuid}");
+
+    if let Ok(mut jobs) = PLAYER_ELO_JOBS.lock() {
+        jobs.retain(|job_id, entry| {
+            let same_puuid = entry.meta.puuid.trim() == normalized_puuid;
+            let duplicate_server =
+                entry.meta.sgp_server_id.eq_ignore_ascii_case(canonical_sgp_server_id)
+                    || job_id == &legacy_unknown_job_id;
+            !(same_puuid && duplicate_server && job_id != canonical_job_id)
+        });
+    }
+
+    delete_duplicate_player_elo_jobs_service(
+        normalized_puuid,
+        canonical_job_id,
+        canonical_sgp_server_id,
+    );
+}
+
+fn player_elo_status(
+    job_id: &str,
+    status: &str,
+    message: String,
+    next_poll_delay_ms: u64,
+    cached: bool,
+    result: Option<PlayerEloEstimateResponse>,
+    error: Option<String>,
+) -> PlayerEloEstimateTaskStatus {
+    PlayerEloEstimateTaskStatus {
+        job_id: job_id.to_string(),
+        status: status.to_string(),
+        message,
+        next_poll_delay_ms,
+        cached,
+        result,
+        error,
+    }
+}
+
+fn should_retry_player_elo_in_background(error: &AppError) -> bool {
+    matches!(error, AppError::SgpUnavailable(_) | AppError::Http(_))
+}
+
+fn restored_player_elo_status(
+    job_id: &str,
+    previous: &PlayerEloEstimateTaskStatus,
+) -> PlayerEloEstimateTaskStatus {
+    player_elo_status(
+        job_id,
+        "retrying",
+        "应用已重启，后台任务已恢复，稍后继续探测当前角色外部 ELO".to_string(),
+        PLAYER_ELO_RETRY_INTERVAL.as_millis() as u64,
+        false,
+        previous.result.clone(),
+        None,
+    )
+}
+
+fn spawn_player_elo_estimate_worker(
+    job_id: String,
+    sgp_server_id: Option<String>,
+    summoner: SummonerInfo,
+    job_meta: PlayerEloTaskMeta,
+    initial_retry_round: usize,
+    initial_delay: Option<Duration>,
+) {
+    async_runtime::spawn(async move {
+        if let Some(delay) = initial_delay {
+            tokio::time::sleep(delay).await;
+        }
+
+        let mut retry_round = initial_retry_round;
+
+        loop {
+            let mut latest_partial =
+                snapshot_player_elo_job(&job_id).and_then(|status| status.result);
+            let status = match create_clients() {
+                Ok(clients) => {
+                    if retry_round > 0 {
+                        let probe_status = match probe_player_external_elo(
+                            &clients.auth,
+                            sgp_server_id.as_deref(),
+                            &summoner,
+                        )
+                        .await
+                        {
+                            Ok(Some(owner_elo)) => {
+                                store_player_elo_job(
+                                    player_elo_status(
+                                        &job_id,
+                                        "running",
+                                        format!(
+                                            "后台第 {} 次重试探针已恢复：当前角色外部 ELO {:.1}，开始整轮重算",
+                                            retry_round, owner_elo
+                                        ),
+                                        0,
+                                        false,
+                                        latest_partial.clone(),
+                                        None,
+                                    ),
+                                    Some(&job_meta),
+                                );
+                                None
+                            }
+                            Ok(None) => {
+                                let current_round = retry_round;
+                                retry_round += 1;
+                                Some(player_elo_status(
+                                    &job_id,
+                                    "retrying",
+                                    format!(
+                                        "后台第 {} 次重试探针仍未命中当前角色 ELO，本轮跳过整轮计算，1 分钟后继续",
+                                        current_round
+                                    ),
+                                    PLAYER_ELO_RETRY_INTERVAL.as_millis() as u64,
+                                    false,
+                                    latest_partial.clone(),
+                                    None,
+                                ))
+                            }
+                            Err(error) if should_retry_player_elo_in_background(&error) => {
+                                let current_round = retry_round;
+                                retry_round += 1;
+                                Some(player_elo_status(
+                                    &job_id,
+                                    "retrying",
+                                    format!(
+                                        "后台第 {} 次重试探针失败：{}。本轮跳过整轮计算，1 分钟后继续",
+                                        current_round,
+                                        app_error(error)
+                                    ),
+                                    PLAYER_ELO_RETRY_INTERVAL.as_millis() as u64,
+                                    false,
+                                    latest_partial.clone(),
+                                    None,
+                                ))
+                            }
+                            Err(error) => Some(player_elo_status(
+                                &job_id,
+                                "failed",
+                                "角色 ELO 计算失败".to_string(),
+                                0,
+                                false,
+                                latest_partial.clone(),
+                                Some(app_error(error)),
+                            )),
+                        };
+
+                        if let Some(status) = probe_status {
+                            status
+                        } else {
+                            match estimate_player_elo_with_progress(
+                                &clients.lcu,
+                                &clients.auth,
+                                sgp_server_id.as_deref(),
+                                summoner.clone(),
+                                |partial_result, message| {
+                                    latest_partial = Some(partial_result.clone());
+                                    store_player_elo_job(
+                                        player_elo_status(
+                                            &job_id,
+                                            "running",
+                                            format!("后台第 {} 次重试中：{}", retry_round, message),
+                                            0,
+                                            false,
+                                            Some(partial_result),
+                                            None,
+                                        ),
+                                        Some(&job_meta),
+                                    );
+                                },
+                            )
+                            .await
+                            {
+                                Ok(result) => player_elo_status(
+                                    &job_id,
+                                    "completed",
+                                    format!("后台第 {} 次重试成功，角色 ELO 已更新", retry_round),
+                                    0,
+                                    false,
+                                    Some(result),
+                                    None,
+                                ),
+                                Err(error) if should_retry_player_elo_in_background(&error) => {
+                                    retry_round += 1;
+                                    player_elo_status(
+                                        &job_id,
+                                        "retrying",
+                                        format!(
+                                            "后台仍没拿到可用 ELO，1 分钟后继续先探测当前角色外部 ELO（累计失败 {} 次：{}）",
+                                            retry_round,
+                                            app_error(error)
+                                        ),
+                                        PLAYER_ELO_RETRY_INTERVAL.as_millis() as u64,
+                                        false,
+                                        latest_partial.clone(),
+                                        None,
+                                    )
+                                }
+                                Err(error) => player_elo_status(
+                                    &job_id,
+                                    "failed",
+                                    "角色 ELO 计算失败".to_string(),
+                                    0,
+                                    false,
+                                    latest_partial.clone(),
+                                    Some(app_error(error)),
+                                ),
+                            }
+                        }
+                    } else {
+                        match estimate_player_elo_with_progress(
+                            &clients.lcu,
+                            &clients.auth,
+                            sgp_server_id.as_deref(),
+                            summoner.clone(),
+                            |partial_result, message| {
+                                latest_partial = Some(partial_result.clone());
+                                store_player_elo_job(
+                                    player_elo_status(
+                                        &job_id,
+                                        "running",
+                                        message,
+                                        0,
+                                        false,
+                                        Some(partial_result),
+                                        None,
+                                    ),
+                                    Some(&job_meta),
+                                );
+                            },
+                        )
+                        .await
+                        {
+                            Ok(result) => player_elo_status(
+                                &job_id,
+                                "completed",
+                                "角色 ELO 计算完成".to_string(),
+                                0,
+                                false,
+                                Some(result),
+                                None,
+                            ),
+                            Err(error) if should_retry_player_elo_in_background(&error) => {
+                                retry_round += 1;
+                                player_elo_status(
+                                    &job_id,
+                                    "retrying",
+                                    format!(
+                                        "首次计算没拿到可用 ELO，后台将在 1 分钟后先探测当前角色外部 ELO（第 {} 次失败：{}）",
+                                        retry_round,
+                                        app_error(error)
+                                    ),
+                                    PLAYER_ELO_RETRY_INTERVAL.as_millis() as u64,
+                                    false,
+                                    latest_partial.clone(),
+                                    None,
+                                )
+                            }
+                            Err(error) => player_elo_status(
+                                &job_id,
+                                "failed",
+                                "角色 ELO 计算失败".to_string(),
+                                0,
+                                false,
+                                latest_partial.clone(),
+                                Some(app_error(error)),
+                            ),
+                        }
+                    }
+                }
+                Err(error) => player_elo_status(
+                    &job_id,
+                    "failed",
+                    "客户端连接失败，无法启动角色 ELO 任务".to_string(),
+                    0,
+                    false,
+                    latest_partial.clone(),
+                    Some(app_error(error)),
+                ),
+            };
+
+            let should_retry = status.status == "retrying";
+            store_player_elo_job(status, Some(&job_meta));
+
+            if !should_retry {
+                break;
+            }
+
+            tokio::time::sleep(PLAYER_ELO_RETRY_INTERVAL).await;
+        }
+    });
+}
+
+pub fn initialize_player_elo_jobs() {
+    prune_player_elo_jobs();
+
+    for record in load_player_elo_jobs() {
+        let entry = player_elo_task_entry_from_record(&record);
+        if let Ok(mut jobs) = PLAYER_ELO_JOBS.lock() {
+            jobs.insert(record.job_id.clone(), entry);
+        }
+
+        if !matches!(
+            record.status.status.as_str(),
+            "pending" | "running" | "retrying"
+        ) {
+            continue;
+        }
+
+        let restored_status = restored_player_elo_status(&record.job_id, &record.status);
+        let restored_meta = PlayerEloTaskMeta {
+            puuid: record.puuid.clone(),
+            game_name: record.game_name.clone(),
+            tag_line: record.tag_line.clone(),
+            display_name: record.display_name.clone(),
+            riot_id: record.riot_id.clone(),
+            sgp_server_id: record.sgp_server_id.clone(),
+        };
+        let restored_summoner = SummonerInfo {
+            puuid: record.puuid,
+            game_name: record.game_name,
+            tag_line: record.tag_line,
+            display_name: record.display_name,
+            ..Default::default()
+        };
+
+        store_player_elo_job(restored_status, Some(&restored_meta));
+        spawn_player_elo_estimate_worker(
+            record.job_id,
+            Some(restored_meta.sgp_server_id.clone()),
+            restored_summoner,
+            restored_meta,
+            1,
+            Some(PLAYER_ELO_RESTORE_DELAY),
         );
     }
 }
@@ -954,80 +1522,77 @@ pub async fn start_player_elo_estimate_task(
     let clients = create_clients().map_err(app_error)?;
     let summoner =
         build_player_elo_summoner(puuid, game_name, tag_line, display_name).map_err(app_error)?;
-    let job_id = player_elo_job_id(&summoner, sgp_server_id.as_deref());
+    let resolved_sgp_server_id = resolve_sgp_server_id(&clients.auth, sgp_server_id.as_deref());
+    let job_id = player_elo_job_id(&summoner, Some(&resolved_sgp_server_id));
+    let job_meta = player_elo_task_meta(&summoner, &resolved_sgp_server_id);
     let should_force_refresh = force_refresh.unwrap_or(false);
+    let last_known =
+        load_last_player_elo(&clients.auth, Some(&resolved_sgp_server_id), &summoner);
 
     if should_force_refresh {
-        clear_player_elo_cache_service(&clients.auth, sgp_server_id.as_deref(), &summoner)
+        clear_player_elo_cache_service(&clients.auth, Some(&resolved_sgp_server_id), &summoner)
             .map_err(app_error)?;
     } else if let Some(cached) =
-        load_cached_player_elo(&clients.auth, sgp_server_id.as_deref(), &summoner)
+        load_cached_player_elo(&clients.auth, Some(&resolved_sgp_server_id), &summoner)
     {
-        let status = PlayerEloEstimateTaskStatus {
-            job_id,
-            status: "completed".to_string(),
-            cached: true,
-            result: Some(cached),
-            error: None,
-        };
-        store_player_elo_job(status.clone());
+        let status = player_elo_status(
+            &job_id,
+            "completed",
+            "已命中本地缓存，直接返回角色 ELO".to_string(),
+            0,
+            true,
+            Some(cached),
+            None,
+        );
+        store_player_elo_job(status.clone(), Some(&job_meta));
+        purge_duplicate_player_elo_jobs(
+            &summoner.puuid,
+            &job_id,
+            &resolved_sgp_server_id,
+        );
         return Ok(status);
     }
 
-    if let Some(existing) = snapshot_player_elo_job(&job_id) {
-        if matches!(existing.status.as_str(), "pending" | "running") {
+    let running_status = player_elo_status(
+        &job_id,
+        "running",
+        if should_force_refresh {
+            if last_known.is_some() {
+                "正在清缓存并重算，当前先显示上次成功 ELO".to_string()
+            } else {
+                "正在清缓存并重新计算角色 ELO".to_string()
+            }
+        } else if last_known.is_some() {
+            "未命中当前缓存，当前先显示上次成功 ELO，后台继续校验最新结果".to_string()
+        } else {
+            "正在扫描单人开局样本".to_string()
+        },
+        0,
+        false,
+        last_known,
+        None,
+    );
+    let running_status = match try_claim_player_elo_job(running_status, &job_meta) {
+        Ok(status) => status,
+        Err(existing) => {
+            purge_duplicate_player_elo_jobs(
+                &summoner.puuid,
+                &job_id,
+                &resolved_sgp_server_id,
+            );
             return Ok(existing);
         }
-    }
-
-    let running_status = PlayerEloEstimateTaskStatus {
-        job_id: job_id.clone(),
-        status: "running".to_string(),
-        cached: false,
-        result: None,
-        error: None,
     };
-    store_player_elo_job(running_status.clone());
+    purge_duplicate_player_elo_jobs(&summoner.puuid, &job_id, &resolved_sgp_server_id);
 
-    let spawn_job_id = job_id.clone();
-    let spawn_sgp_server_id = sgp_server_id.clone();
-    let spawn_summoner = summoner.clone();
-    async_runtime::spawn(async move {
-        let status = match create_clients() {
-            Ok(clients) => match estimate_player_elo(
-                &clients.lcu,
-                &clients.auth,
-                spawn_sgp_server_id.as_deref(),
-                spawn_summoner,
-            )
-            .await
-            {
-                Ok(result) => PlayerEloEstimateTaskStatus {
-                    job_id: spawn_job_id.clone(),
-                    status: "completed".to_string(),
-                    cached: false,
-                    result: Some(result),
-                    error: None,
-                },
-                Err(error) => PlayerEloEstimateTaskStatus {
-                    job_id: spawn_job_id.clone(),
-                    status: "failed".to_string(),
-                    cached: false,
-                    result: None,
-                    error: Some(app_error(error)),
-                },
-            },
-            Err(error) => PlayerEloEstimateTaskStatus {
-                job_id: spawn_job_id.clone(),
-                status: "failed".to_string(),
-                cached: false,
-                result: None,
-                error: Some(app_error(error)),
-            },
-        };
-
-        store_player_elo_job(status);
-    });
+    spawn_player_elo_estimate_worker(
+        job_id.clone(),
+        Some(resolved_sgp_server_id),
+        summoner,
+        job_meta,
+        0,
+        None,
+    );
 
     Ok(running_status)
 }
@@ -1036,8 +1601,15 @@ pub async fn start_player_elo_estimate_task(
 pub fn get_player_elo_estimate_task(job_id: String) -> Result<PlayerEloEstimateTaskStatus, String> {
     prune_player_elo_jobs();
     snapshot_player_elo_job(job_id.trim()).ok_or_else(|| {
-        app_error(AppError::InvalidInput("角色 ELO 任务不存在或已过期".to_string()))
+        app_error(AppError::InvalidInput(
+            "角色 ELO 任务不存在或已过期".to_string(),
+        ))
     })
+}
+
+#[tauri::command]
+pub fn get_player_elo_queue() -> PlayerEloQueueSnapshot {
+    player_elo_queue_snapshot()
 }
 
 #[tauri::command]
@@ -1053,6 +1625,24 @@ pub async fn clear_player_elo_cache(
         build_player_elo_summoner(puuid, game_name, tag_line, display_name).map_err(app_error)?;
 
     clear_player_elo_cache_service(&clients.auth, sgp_server_id.as_deref(), &summoner)
+        .map_err(app_error)
+}
+
+#[tauri::command]
+pub async fn debug_external_player_elo_lookup(
+    riot_id: String,
+    sgp_server_id: String,
+) -> Result<ExternalEloLookupDebugResponse, String> {
+    debug_external_elo_lookup(riot_id.trim(), sgp_server_id.trim())
+        .await
+        .map_err(app_error)
+}
+
+#[tauri::command]
+pub async fn debug_official_api() -> Result<OfficialApiDebugResponse, String> {
+    let clients = create_clients().map_err(app_error)?;
+    debug_official_api_probe(&clients.lcu, &clients.auth, None)
+        .await
         .map_err(app_error)
 }
 
@@ -1247,6 +1837,25 @@ pub async fn load_live_game(depth: usize) -> Result<LiveGameResponse, String> {
     }
 
     Err(app_error(AppError::LiveGameUnavailable))
+}
+
+/// 查询指定账号（puuid）当前是否在游戏中，并返回进行中对局的双方阵容。
+#[tauri::command]
+pub async fn query_player_active_game(
+    puuid: String,
+    sgp_server_id: Option<String>,
+) -> Result<PlayerActiveGame, String> {
+    let clients = create_clients().map_err(app_error)?;
+    let sgp = crate::services::sgp::SgpClient::new(
+        &clients.lcu,
+        &clients.auth,
+        sgp_server_id.as_deref(),
+    )
+    .await
+    .map_err(app_error)?;
+    sgp.active_game_by_puuid(puuid.trim())
+        .await
+        .map_err(app_error)
 }
 
 async fn resolve_summoner(clients: &Clients, query: &str) -> AppResult<SummonerInfo> {
@@ -1731,11 +2340,10 @@ fn live_queue_filter(
 }
 
 fn is_hex_aram_game(queue_id: u32, game_mode: &str) -> bool {
-    queue_id == 2400
-        || matches!(
-            game_mode.to_ascii_uppercase().as_str(),
-            "STRAWBERRY" | "KIWI"
-        )
+    let normalized_mode = game_mode.to_ascii_uppercase();
+    matches!(queue_id, 2400 | 2410 | 2450)
+        || matches!(normalized_mode.as_str(), "STRAWBERRY" | "KIWI")
+        || normalized_mode.starts_with("KIWI_")
 }
 
 fn filter_live_stats(
@@ -1955,6 +2563,16 @@ mod tests {
             .await
             .expect("应能读取当前召唤师");
 
+        let _ = clear_player_elo_cache(
+            summoner.puuid.clone(),
+            summoner.game_name.clone(),
+            summoner.tag_line.clone(),
+            Some(summoner.display_name.clone()),
+            None,
+        )
+        .await
+        .expect("应能先清空当前角色 ELO 缓存");
+
         let result = load_player_elo_estimate(
             summoner.puuid.clone(),
             summoner.game_name.clone(),
@@ -1994,15 +2612,18 @@ mod tests {
 
         println!(
             "current summoner => display_name='{}' game_name='{}' tag_line='{}' puuid='{}'",
-            summoner.display_name,
-            summoner.game_name,
-            summoner.tag_line,
-            summoner.puuid
+            summoner.display_name, summoner.game_name, summoner.tag_line, summoner.puuid
         );
 
-        let stats = load_player_stats(&clients.lcu, Some(&clients.auth), None, summoner.clone(), 30)
-            .await
-            .expect("应能读取当前战绩");
+        let stats = load_player_stats(
+            &clients.lcu,
+            Some(&clients.auth),
+            None,
+            summoner.clone(),
+            30,
+        )
+        .await
+        .expect("应能读取当前战绩");
         let solo_games = stats
             .recent_games
             .iter()
@@ -2011,7 +2632,10 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
 
-        println!("solo sample count in first 30 games => {}", solo_games.len());
+        println!(
+            "solo sample count in first 30 games => {}",
+            solo_games.len()
+        );
 
         for game in solo_games {
             println!(
@@ -2019,14 +2643,10 @@ mod tests {
                 game.game_id, game.champion_id, game.queue_id, game.game_mode, game.game_creation
             );
 
-            let detail = load_match_detail_service(
-                &clients.lcu,
-                Some(&clients.auth),
-                None,
-                game.game_id,
-            )
-            .await
-            .expect("应能读取样本局详情");
+            let detail =
+                load_match_detail_service(&clients.lcu, Some(&clients.auth), None, game.game_id)
+                    .await
+                    .expect("应能读取样本局详情");
 
             for team in detail.teams {
                 for player in team.players {

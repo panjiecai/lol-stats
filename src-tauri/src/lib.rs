@@ -5,6 +5,10 @@ mod services;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|_| {
+            commands::initialize_player_elo_jobs();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::app_version,
             commands::accept_ready_check,
@@ -31,8 +35,12 @@ pub fn run() {
             commands::load_player_elo_estimate,
             commands::start_player_elo_estimate_task,
             commands::get_player_elo_estimate_task,
+            commands::get_player_elo_queue,
             commands::clear_player_elo_cache,
+            commands::debug_external_player_elo_lookup,
+            commands::debug_official_api,
             commands::load_live_game,
+            commands::query_player_active_game,
             commands::load_friends,
             commands::set_chat_availability,
             commands::set_chat_status_message,

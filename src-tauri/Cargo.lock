@@ -2168,6 +2168,7 @@ version = "0.7.0"
 dependencies = [
  "arboard",
  "base64 0.22.1",
+ "chrono",
  "futures",
  "image",
  "md5",

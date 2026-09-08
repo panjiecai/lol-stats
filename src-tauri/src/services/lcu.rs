@@ -493,6 +493,470 @@ fn normalize_lcu_asset_path(path: &str) -> AppResult<String> {
     Ok(path.to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::client_discovery::discover_primary_client;
+    use crate::services::stats::{load_match_detail, load_player_stats};
+    use base64::Engine;
+    use serde_json::Value;
+    use std::collections::HashSet;
+
+    fn contains_rating_term(text: &str) -> bool {
+        let normalized = text.to_ascii_lowercase();
+        [
+            "mmr",
+            "elo",
+            "rating",
+            "rank",
+            "league",
+            "lp",
+            "skill",
+            "matchmaking",
+        ]
+        .iter()
+        .any(|term| normalized.contains(term))
+    }
+
+    fn collect_help_hits(value: &Value, path: &str, hits: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let next_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if contains_rating_term(key) {
+                        hits.push(next_path.clone());
+                    }
+                    collect_help_hits(child, &next_path, hits);
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    collect_help_hits(child, &format!("{path}[{index}]"), hits);
+                }
+            }
+            Value::String(text) => {
+                if contains_rating_term(text) {
+                    hits.push(format!("{path}={text}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn search_json_targets(value: &Value, path: &str, needles: &[&str], hits: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let next_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    let key_lower = key.to_ascii_lowercase();
+                    if needles
+                        .iter()
+                        .any(|needle| key_lower.contains(&needle.to_ascii_lowercase()))
+                    {
+                        hits.push(format!("{next_path} => {}", child));
+                    }
+                    search_json_targets(child, &next_path, needles, hits);
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    search_json_targets(child, &format!("{path}[{index}]"), needles, hits);
+                }
+            }
+            Value::String(text) => {
+                let text_lower = text.to_ascii_lowercase();
+                if needles
+                    .iter()
+                    .any(|needle| text_lower.contains(&needle.to_ascii_lowercase()))
+                {
+                    hits.push(format!("{path} => {text}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn decode_jwt_payload(jwt: &str) -> Option<(Value, Value)> {
+        let mut parts = jwt.split('.');
+        let header = parts.next()?;
+        let payload = parts.next()?;
+        let header_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(header.as_bytes())
+            .ok()?;
+        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload.as_bytes())
+            .ok()?;
+        let header_json = serde_json::from_slice::<Value>(&header_bytes).ok()?;
+        let payload_json = serde_json::from_slice::<Value>(&payload_bytes).ok()?;
+        Some((header_json, payload_json))
+    }
+
+    #[tokio::test]
+    #[ignore = "手动触发：探测本机 LCU /help 是否暴露 MMR/ELO 相关接口"]
+    async fn manual_probe_lcu_help_for_rating_endpoints() {
+        let auth = discover_primary_client().expect("应能找到已登录客户端");
+        let lcu = LcuClient::new(&auth).expect("应能创建 LCU 客户端");
+
+        let response = lcu
+            .http
+            .get(format!("{}{}", lcu.base_url, "/help"))
+            .header("Authorization", &lcu.auth_header)
+            .send()
+            .await
+            .expect("/help 请求应成功");
+
+        let status = response.status();
+        let text = response.text().await.expect("应能读取 /help 文本");
+        println!("lcu /help status => {}", status);
+
+        let json: Value = serde_json::from_str(&text).expect("/help 应返回 JSON");
+        let mut hits = Vec::new();
+        collect_help_hits(&json, "", &mut hits);
+        hits.sort();
+        hits.dedup();
+
+        println!("lcu /help rating-like hits => {:?}", hits);
+    }
+
+    #[tokio::test]
+    #[ignore = "手动触发：探测 LCU 候选 ranked/matchmaking 端点的实际返回"]
+    async fn manual_probe_lcu_candidate_rating_endpoints() {
+        let auth = discover_primary_client().expect("应能找到已登录客户端");
+        let lcu = LcuClient::new(&auth).expect("应能创建 LCU 客户端");
+        let candidates = [
+            "/lol-ranked/v1/current-ranked-stats",
+            "/lol-ranked/v1/signed-ranked-stats",
+            "/lol-ranked/v1/current-lp-change-notification",
+            "/lol-platform-config/v1/namespaces/QueueRestriction",
+            "/lol-ranked/v1/top-rated-ladders-enabled",
+            "/lol-ranked/v1/challenger-ladders-enabled",
+        ];
+
+        for path in candidates {
+            let response = lcu
+                .http
+                .get(format!("{}{}", lcu.base_url, path))
+                .header("Authorization", &lcu.auth_header)
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("{path} 请求失败: {error}"));
+
+            let status = response.status();
+            let text = response.text().await.expect("应能读取文本");
+            println!("\nendpoint => {path}");
+            println!("status => {status}");
+
+            let preview = if text.len() > 1800 {
+                format!("{}...(truncated)", &text[..1800])
+            } else {
+                text.clone()
+            };
+            println!("body => {preview}");
+
+            if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                let mut hits = Vec::new();
+                collect_help_hits(&json, "", &mut hits);
+                hits.sort();
+                hits.dedup();
+                println!("rating-like json hits => {:?}", hits);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "手动触发：从 LCU /help 定位 ranked ladder 和 leaderboard 候选端点"]
+    async fn manual_probe_lcu_help_ranked_targets() {
+        let auth = discover_primary_client().expect("应能找到已登录客户端");
+        let lcu = LcuClient::new(&auth).expect("应能创建 LCU 客户端");
+        let response = lcu
+            .http
+            .get(format!("{}{}", lcu.base_url, "/help"))
+            .header("Authorization", &lcu.auth_header)
+            .send()
+            .await
+            .expect("/help 请求应成功");
+        let text = response.text().await.expect("应能读取 /help 文本");
+        let json: Value = serde_json::from_str(&text).expect("/help 应返回 JSON");
+
+        let needles = [
+            "GetLolRankedV1LeagueLaddersByPuuid",
+            "GetLolRankedV1RatedLadderByQueueType",
+            "GetLolRankedV1SocialLeaderboardRankedQueueStatsForPuuids",
+            "GetLolRankedV1ApexLeaguesByQueueTypeByTier",
+            "/lol-ranked/v1/league-ladders",
+            "/lol-ranked/v1/rated-ladder",
+            "/lol-ranked/v1/social-leaderboard",
+        ];
+        let mut hits = Vec::new();
+        search_json_targets(&json, "", &needles, &mut hits);
+        hits.sort();
+        hits.dedup();
+
+        for hit in hits {
+            println!("help target => {hit}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "手动触发：解码 signed-ranked-stats 的 JWT 载荷"]
+    async fn manual_probe_signed_ranked_stats_jwt() {
+        let auth = discover_primary_client().expect("应能找到已登录客户端");
+        let lcu = LcuClient::new(&auth).expect("应能创建 LCU 客户端");
+        let response = lcu
+            .http
+            .get(format!(
+                "{}{}",
+                lcu.base_url, "/lol-ranked/v1/signed-ranked-stats"
+            ))
+            .header("Authorization", &lcu.auth_header)
+            .send()
+            .await
+            .expect("signed-ranked-stats 请求应成功");
+        let text = response.text().await.expect("应能读取返回文本");
+        let json: Value = serde_json::from_str(&text).expect("signed-ranked-stats 应返回 JSON");
+        let jwt = json
+            .get("jwt")
+            .and_then(Value::as_str)
+            .expect("返回里应包含 jwt");
+        let (header, payload) = decode_jwt_payload(jwt).expect("jwt 应能正常解码");
+
+        println!("signed-ranked-stats jwt header => {header}");
+        println!("signed-ranked-stats jwt payload => {payload}");
+
+        let mut hits = Vec::new();
+        search_json_targets(
+            &payload,
+            "",
+            &["mmr", "elo", "rating", "rank", "league", "lp", "skill"],
+            &mut hits,
+        );
+        hits.sort();
+        hits.dedup();
+
+        println!("signed-ranked-stats jwt rating-like hits => {:?}", hits);
+    }
+
+    #[tokio::test]
+    #[ignore = "手动触发：实探 ranked ladder 和 leaderboard 候选端点"]
+    async fn manual_probe_ranked_ladder_candidates() {
+        let auth = discover_primary_client().expect("应能找到已登录客户端");
+        let lcu = LcuClient::new(&auth).expect("应能创建 LCU 客户端");
+        let summoner = lcu.current_summoner().await.expect("应能读取当前召唤师");
+        let puuid = summoner.puuid;
+
+        let candidates = [
+            format!("/lol-ranked/v1/league-ladders/{puuid}"),
+            format!("/lol-ranked/v1/league-ladders/by-puuid/{puuid}"),
+            "/lol-ranked/v1/rated-ladder/RANKED_SOLO_5x5".to_string(),
+            "/lol-ranked/v1/rated-ladder/RANKED_TFT".to_string(),
+            "/lol-ranked/v1/apex-leagues/RANKED_SOLO_5x5/CHALLENGER".to_string(),
+            "/lol-ranked/v1/apex-leagues/RANKED_TFT/CHALLENGER".to_string(),
+            format!("/lol-ranked/v1/social-leaderboard/ranked-queue-stats-for-puuids?puuids={puuid}"),
+            format!("/lol-ranked/v1/social-leaderboard/ranked-queue-stats-for-puuids?queueType=RANKED_SOLO_5x5&puuids={puuid}"),
+            format!("/lol-ranked/v1/social-leaderboard/ranked-queue-stats-for-puuids?queueType=RANKED_TFT&puuids={puuid}"),
+        ];
+
+        for path in candidates {
+            let response = lcu
+                .http
+                .get(format!("{}{}", lcu.base_url, path))
+                .header("Authorization", &lcu.auth_header)
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("{path} 请求失败: {error}"));
+            let status = response.status();
+            let text = response.text().await.expect("应能读取文本");
+            let preview = if text.len() > 1200 {
+                format!("{}...(truncated)", &text[..1200])
+            } else {
+                text
+            };
+            println!("\ncandidate => {path}");
+            println!("status => {status}");
+            println!("body => {preview}");
+        }
+    }
+
+    fn extract_queue_probe(value: &Value) -> Vec<String> {
+        let Some(queues) = value.get("queues").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+
+        queues
+            .iter()
+            .filter_map(|queue| {
+                let queue_type = queue.get("queueType").and_then(Value::as_str).unwrap_or("");
+                let tier = queue.get("tier").and_then(Value::as_str).unwrap_or("");
+                let rank = queue
+                    .get("rank")
+                    .or_else(|| queue.get("division"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let league_points = queue
+                    .get("leaguePoints")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                let cumulative_lp = queue
+                    .get("cumulativeLp")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                let rated_rating = queue
+                    .get("ratedRating")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                let wins = queue
+                    .get("wins")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                let losses = queue
+                    .get("losses")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+
+                let has_signal = !queue_type.is_empty()
+                    && (!tier.is_empty()
+                        || rated_rating != 0
+                        || cumulative_lp != 0
+                        || league_points != 0
+                        || wins != 0
+                        || losses != 0);
+                if !has_signal {
+                    return None;
+                }
+
+                Some(format!(
+                    "{} tier={} rank={} lp={} cumulativeLp={} ratedRating={} w/l={}/{}",
+                    queue_type,
+                    tier,
+                    rank,
+                    league_points,
+                    cumulative_lp,
+                    rated_rating,
+                    wins,
+                    losses
+                ))
+            })
+            .collect()
+    }
+
+    async fn load_raw_ranked_probe(lcu: &LcuClient, puuid: &str) -> Value {
+        let response = lcu
+            .http
+            .get(format!(
+                "{}{}",
+                lcu.base_url,
+                format!("/lol-ranked/v1/ranked-stats/{puuid}")
+            ))
+            .header("Authorization", &lcu.auth_header)
+            .send()
+            .await
+            .expect("ranked-stats 请求应成功");
+        let text = response.text().await.expect("应能读取 ranked-stats 文本");
+        serde_json::from_str(&text).expect("ranked-stats 应返回 JSON")
+    }
+
+    #[tokio::test]
+    #[ignore = "手动触发：对比当前账号单人开局与组队开局对局里疑似分数字段"]
+    async fn manual_compare_solo_and_premade_rating_fields() {
+        let auth = discover_primary_client().expect("应能找到已登录客户端");
+        let lcu = LcuClient::new(&auth).expect("应能创建 LCU 客户端");
+        let summoner = lcu.current_summoner().await.expect("应能读取当前召唤师");
+
+        let stats = load_player_stats(&lcu, Some(&auth), None, summoner.clone(), 80)
+            .await
+            .expect("应能读取当前战绩");
+        let solo_game = stats
+            .recent_games
+            .iter()
+            .find(|game| game.premade_teammate_puuids.is_empty())
+            .cloned()
+            .expect("最近 80 局里至少应有一局单人开局");
+        let premade_game = stats
+            .recent_games
+            .iter()
+            .find(|game| !game.premade_teammate_puuids.is_empty())
+            .cloned()
+            .expect("最近 80 局里至少应有一局组队开局");
+
+        for (label, game, premades) in [
+            ("solo", solo_game, HashSet::<String>::new()),
+            (
+                "premade",
+                premade_game.clone(),
+                premade_game
+                    .premade_teammate_puuids
+                    .iter()
+                    .map(|puuid| puuid.to_ascii_lowercase())
+                    .collect::<HashSet<_>>(),
+            ),
+        ] {
+            println!(
+                "\n===== {} game_id={} queue_id={} mode={} premades={:?} =====",
+                label, game.game_id, game.queue_id, game.game_mode, game.premade_teammate_puuids
+            );
+
+            let detail = load_match_detail(&lcu, Some(&auth), None, game.game_id)
+                .await
+                .expect("应能读取对局详情");
+
+            let mut rated_values = Vec::new();
+            let mut cumulative_values = Vec::new();
+
+            for team in detail.teams {
+                for player in team.players {
+                    let raw_ranked = load_raw_ranked_probe(&lcu, &player.puuid).await;
+                    let queues = extract_queue_probe(&raw_ranked);
+                    let rated_rating = raw_ranked
+                        .get("highestRankedEntry")
+                        .and_then(|value| value.get("ratedRating"))
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default();
+                    let cumulative_lp = raw_ranked
+                        .get("highestRankedEntry")
+                        .and_then(|value| value.get("cumulativeLp"))
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default();
+                    if rated_rating != 0 {
+                        rated_values.push(rated_rating);
+                    }
+                    if cumulative_lp != 0 {
+                        cumulative_values.push(cumulative_lp);
+                    }
+
+                    let is_owner = player.puuid.eq_ignore_ascii_case(&summoner.puuid);
+                    let is_same_team = player.team_id == game.team_id;
+                    let is_premade = premades.contains(&player.puuid.to_ascii_lowercase());
+                    println!(
+                        "player => owner={} sameTeam={} premade={} team={} subteam={} riot='{}#{}' summoner='{}' probes={:?}",
+                        is_owner,
+                        is_same_team,
+                        is_premade,
+                        player.team_id,
+                        player.player_subteam_id,
+                        player.game_name,
+                        player.tag_line,
+                        player.summoner_name,
+                        queues
+                    );
+                }
+            }
+
+            println!(
+                "{} summary => nonZeroRatedRating={:?} nonZeroCumulativeLp={:?}",
+                label, rated_values, cumulative_values
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RiotClient {
     http: Client,

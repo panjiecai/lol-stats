@@ -7,14 +7,17 @@ import type {
   GameAssetBundle,
   OpenMatchPayload,
   PlayerStatsResponse,
-  RankedQueueEntry,
   RankedStatsResponse,
   RecentGame,
   ShareSettings,
 } from "../types"
-import { rankIconLarge } from "../rankIcons"
 import { mitigationValue, riotId, teamMitigationValue } from "../utils"
+import {
+  MAX_STATS_DEPTH,
+  STATS_DEPTH_OPTIONS,
+} from "../statsDepth"
 import MatchHistoryPanel from "./MatchHistoryPanel.vue"
+import PlayerIdentityCard from "./PlayerIdentityCard.vue"
 import StatsPanel from "./StatsPanel.vue"
 
 type RecordTab = "recent" | "stats"
@@ -39,6 +42,7 @@ const props = defineProps<{
   statsDepth: number
   error: string
   sgpServerId?: string
+  isSelf?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -65,23 +69,19 @@ let statsDateCloseTimer = 0
 
 const rankedQueueIds = new Set([420, 440])
 const normalQueueIds = new Set([400, 430, 480, 490])
-const hexAramQueueIds = new Set([2400])
 const aramQueueIds = new Set([450])
-const apexTiers = new Set(["MASTER", "GRANDMASTER", "CHALLENGER"])
-const statsDepthOptions = [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
-const tierLabels: Record<string, string> = {
-  IRON: "坚韧黑铁",
-  BRONZE: "英勇黄铜",
-  SILVER: "不屈白银",
-  GOLD: "荣耀黄金",
-  PLATINUM: "华贵铂金",
-  EMERALD: "流光翡翠",
-  DIAMOND: "璀璨钻石",
-  MASTER: "超凡大师",
-  GRANDMASTER: "傲世宗师",
-  CHALLENGER: "最强王者",
-}
+const statsDepthOptions = STATS_DEPTH_OPTIONS
 
+function isHexAramGame(game: RecentGame) {
+  const queueId = game.queueId
+  const mode = (game.gameMode || "").toUpperCase()
+  return (
+    [2400, 2410, 2450].includes(queueId) ||
+    mode === "STRAWBERRY" ||
+    mode === "KIWI" ||
+    mode.startsWith("KIWI_")
+  )
+}
 const queueOptions: QueueOption[] = [
   {
     key: "ranked",
@@ -98,7 +98,7 @@ const queueOptions: QueueOption[] = [
   {
     key: "arena",
     label: "海克斯大乱斗",
-    matches: (game) => hexAramQueueIds.has(game.queueId),
+    matches: (game) => isHexAramGame(game),
   },
   {
     key: "aram",
@@ -152,20 +152,6 @@ const emptyFilterMessage = computed(() => {
     return "当前样本里没有匹配到这个模式的对局"
   }
   return `当前样本里没有匹配到这些条件的对局：${activeStatsFilters.value.join(" / ")}`
-})
-
-const rankCards = computed(() => {
-  const ranked = props.rankedStats
-  if (!ranked) return []
-
-  const flex = ranked.queueMap.RANKED_FLEX_SR
-  const solo = ranked.queueMap.RANKED_SOLO_5x5
-  return [
-    { label: "当前灵活组排", value: formatCurrentRank(flex), tier: flex.tier },
-    { label: "当前单双排", value: formatCurrentRank(solo), tier: solo.tier },
-    { label: "历史灵活组排最高", value: formatHighestRank(flex), tier: bestTier(flex) },
-    { label: "历史单双排最高", value: formatHighestRank(solo), tier: bestTier(solo) },
-  ]
 })
 
 watch(
@@ -236,7 +222,7 @@ function ensureStatsCoverage() {
   const loadedDepth = props.fullStats.depthLoaded || props.fullStats.recentGames.length
   const requestedDepth = props.fullStats.depthRequested || loadedDepth
 
-  if (loadedDepth < requestedDepth || requestedDepth >= 1000) {
+  if (loadedDepth < requestedDepth || requestedDepth >= MAX_STATS_DEPTH) {
     return
   }
 
@@ -329,14 +315,14 @@ function soloQueueFilterMatches(
 }
 
 function estimateStatsCoverageDepth(matchedCount: number, currentDepth: number, targetDepth: number) {
-  if (currentDepth >= 1000) return 1000
+  if (currentDepth >= MAX_STATS_DEPTH) return MAX_STATS_DEPTH
   if (matchedCount <= 0) {
-    return Math.min(1000, Math.max(targetDepth, currentDepth * 2, currentDepth + 200))
+    return Math.min(MAX_STATS_DEPTH, Math.max(targetDepth, currentDepth * 2, currentDepth + 200))
   }
 
   const estimatedDepth = Math.ceil((currentDepth * targetDepth) / matchedCount)
   const paddedDepth = Math.ceil((estimatedDepth * 1.15) / 50) * 50
-  return Math.min(1000, Math.max(targetDepth, currentDepth + 50, paddedDepth))
+  return Math.min(MAX_STATS_DEPTH, Math.max(targetDepth, currentDepth + 50, paddedDepth))
 }
 
 function dateStartTimestamp(value: string) {
@@ -372,54 +358,7 @@ function queueCount(option: QueueOption) {
 function clampStatsDepth(value: unknown) {
   const numberValue = Number(value)
   if (!Number.isFinite(numberValue)) return props.statsDepth
-  return Math.min(1000, Math.max(50, Math.round(numberValue)))
-}
-
-function formatCurrentRank(entry: RankedQueueEntry) {
-  return formatRank(entry.tier, entry.division, entry.leaguePoints)
-}
-
-function formatHighestRank(entry: RankedQueueEntry) {
-  return formatRank(bestTier(entry), bestDivision(entry))
-}
-
-function bestTier(entry: RankedQueueEntry) {
-  return (
-    entry.highestTier ||
-    entry.previousSeasonHighestTier ||
-    entry.previousSeasonEndTier ||
-    ""
-  )
-}
-
-function bestDivision(entry: RankedQueueEntry) {
-  return (
-    entry.highestDivision ||
-    entry.previousSeasonHighestDivision ||
-    entry.previousSeasonEndDivision ||
-    ""
-  )
-}
-
-function formatRank(tier: string, division = "", leaguePoints?: number) {
-  const normalizedTier = tier.trim().toUpperCase()
-  if (!normalizedTier || normalizedTier === "NONE" || normalizedTier === "NA") return "未定级"
-
-  const tierLabel = tierLabels[normalizedTier] || normalizedTier
-  const divisionText = apexTiers.has(normalizedTier) ? "" : normalizeDivision(division)
-  const lpText = typeof leaguePoints === "number" && leaguePoints > 0 ? ` ${leaguePoints}LP` : ""
-  return `${tierLabel}${divisionText ? ` ${divisionText}` : ""}${lpText}`
-}
-
-function normalizeDivision(division: string) {
-  const normalized = division.trim().toUpperCase()
-  if (!normalized || normalized === "NA" || normalized === "NONE") return ""
-  return normalized
-}
-
-function rankTierClass(tier: string) {
-  const normalized = tier.trim().toLowerCase()
-  return normalized ? `tier-${normalized}` : "tier-unranked"
+  return Math.min(MAX_STATS_DEPTH, Math.max(50, Math.round(numberValue)))
 }
 
 function buildFilteredStats(
@@ -531,6 +470,14 @@ function round2(value: number) {
 
 <template>
   <section class="record-view">
+    <PlayerIdentityCard
+      :summoner="currentSummoner"
+      :sgp-server-id="sgpServerId"
+      :ranked-stats="rankedStats"
+      :ranked-loading="rankedLoading"
+      :is-self="isSelf"
+    />
+
     <header class="record-topbar">
       <nav class="record-tabs">
         <button :class="{ active: activeTab === 'recent' }" @click="activeTab = 'recent'">
@@ -548,29 +495,8 @@ function round2(value: number) {
           <RefreshCw v-else :size="15" />
           刷新
         </button>
-        <div class="player-chip" v-if="activeTab === 'recent' && currentSummoner">
-          {{ riotId(currentSummoner) }}
-        </div>
       </div>
     </header>
-
-    <section class="rank-strip" v-if="activeTab === 'recent' && (rankedLoading || rankCards.length)">
-      <div class="rank-card loading" v-if="rankedLoading && !rankCards.length">
-        <span>段位</span>
-        <strong>读取中</strong>
-      </div>
-      <article
-        v-for="card in rankCards"
-        :key="card.label"
-        :class="['rank-card', rankTierClass(card.tier)]"
-      >
-        <img class="rank-card-icon" :src="rankIconLarge(card.tier)" :alt="card.value" />
-        <div class="rank-card-text">
-          <span>{{ card.label }}</span>
-          <strong>{{ card.value }}</strong>
-        </div>
-      </article>
-    </section>
 
     <div class="loading-pill" v-if="loading">正在读取数据</div>
 
@@ -964,20 +890,6 @@ function round2(value: number) {
   gap: 10px;
 }
 
-.player-chip {
-  max-width: 280px;
-  overflow: hidden;
-  border: 1px solid #d6e5e1;
-  border-radius: 999px;
-  color: #304f4a;
-  background: #ffffff;
-  font-size: 13px;
-  font-weight: 700;
-  padding: 7px 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .refresh-tab {
   display: inline-flex;
   flex: 0 0 auto;
@@ -997,105 +909,6 @@ function round2(value: number) {
 .refresh-tab:hover:not(:disabled) {
   color: #ffffff;
   background: #1f5f56;
-}
-
-.rank-strip {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.rank-card {
-  --rank-accent: #7d8b91;
-  display: flex;
-  min-width: 0;
-  min-height: 54px;
-  align-items: center;
-  gap: 9px;
-  border: 1px solid #dce7e4;
-  border-left: 4px solid var(--rank-accent);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.86);
-  box-shadow: 0 10px 24px rgba(32, 67, 73, 0.06);
-  padding: 8px 10px;
-}
-
-.rank-card-icon {
-  width: 42px;
-  height: 42px;
-  flex: 0 0 auto;
-  object-fit: contain;
-  filter: drop-shadow(0 4px 8px rgba(32, 67, 73, 0.16));
-}
-
-.rank-card-text {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  justify-content: center;
-  gap: 5px;
-}
-
-.rank-card span {
-  overflow: hidden;
-  color: #6d7b80;
-  font-size: 11px;
-  font-weight: 800;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.rank-card strong {
-  overflow: hidden;
-  color: #1f2a2e;
-  font-size: 14px;
-  line-height: 1.15;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.rank-card.loading strong {
-  color: #657179;
-}
-
-.rank-card.tier-iron {
-  --rank-accent: #68727a;
-}
-
-.rank-card.tier-bronze {
-  --rank-accent: #a56638;
-}
-
-.rank-card.tier-silver {
-  --rank-accent: #8c9faa;
-}
-
-.rank-card.tier-gold {
-  --rank-accent: #d0a02f;
-}
-
-.rank-card.tier-platinum {
-  --rank-accent: #39a18c;
-}
-
-.rank-card.tier-emerald {
-  --rank-accent: #28a85b;
-}
-
-.rank-card.tier-diamond {
-  --rank-accent: #4d8de8;
-}
-
-.rank-card.tier-master {
-  --rank-accent: #9a66d6;
-}
-
-.rank-card.tier-grandmaster {
-  --rank-accent: #d24d55;
-}
-
-.rank-card.tier-challenger {
-  --rank-accent: #d89f34;
 }
 
 .loading-pill {
@@ -1159,10 +972,6 @@ function round2(value: number) {
 }
 
 @media (max-width: 1100px) {
-  .rank-strip {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .queue-picker.centered {
     grid-template-columns: repeat(2, minmax(0, 180px));
   }

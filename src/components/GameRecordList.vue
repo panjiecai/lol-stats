@@ -15,7 +15,7 @@ import type {
   OpenMatchPayload,
   RecentGame,
 } from "../types"
-import { fixed, formatDate, mitigationValue, teamMitigationValue } from "../utils"
+import { computeBull, fixed, formatDate, mitigationValue, teamMitigationValue } from "../utils"
 import AssetIcon from "./AssetIcon.vue"
 import ChampionAvatar from "./ChampionAvatar.vue"
 
@@ -75,6 +75,8 @@ function queueName(game: RecentGame) {
     1712: "斗魂竞技场",
     1900: "无限火力",
     2400: "海克斯大乱斗",
+    2410: "海斗大赛",
+    2450: "海克斯大乱斗",
   }
 
   return map[game.queueId] || game.gameMode || `队列 ${game.queueId}`
@@ -215,6 +217,26 @@ function durationText(seconds: number) {
   return `${minutes}:${String(restSeconds).padStart(2, "0")}`
 }
 
+function isSoloStart(game: RecentGame) {
+  return (game.premadeTeammatePuuids?.length || 0) === 0
+}
+
+function premadeMarkerLabel(game: RecentGame) {
+  return isSoloStart(game) ? "单人开局" : "组队"
+}
+
+function premadeMarkerTitle(game: RecentGame) {
+  if (isSoloStart(game)) return "该局未识别到同队开黑队友"
+
+  const count = game.premadeTeammatePuuids?.length || 0
+  const source = game.premadeSource?.trim()
+  const times = game.premadeTogetherTimes || 0
+  const parts = [`该局识别到 ${count} 名同队组队玩家`]
+  if (source) parts.push(`来源：${source}`)
+  if (times > 0) parts.push(`历史同队 ${times} 次`)
+  return parts.join(" · ")
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
@@ -241,6 +263,15 @@ function detailStatLeader(game: RecentGame, kind: "damage" | "gold" | "mitigatio
     case "conversion":
       return game.teamDamageConversionLeader
   }
+}
+
+function bullOf(player: MatchDetailPlayer) {
+  return computeBull(player.damageToChampions)
+}
+
+function bullTitle(player: MatchDetailPlayer) {
+  const bull = bullOf(player)
+  return `伤害 ${player.damageToChampions} → 牌面 ${bull.digits} · ${bull.hasBull ? bull.label : `没牛 · ${bull.label}`}（0 按 10 点计）`
 }
 
 function outputRating(game: RecentGame) {
@@ -345,6 +376,12 @@ async function openMatchDetail(game: RecentGame) {
       <div class="champion-cell">
         <ChampionAvatar :champion-id="game.championId" :champions="champions" :size="44" />
         <span class="queue-name">{{ queueName(game) }}</span>
+        <span
+          :class="['premade-start-tag', isSoloStart(game) ? 'solo' : 'premade']"
+          :title="premadeMarkerTitle(game)"
+        >
+          {{ premadeMarkerLabel(game) }}
+        </span>
       </div>
 
       <div class="spell-column">
@@ -573,7 +610,10 @@ async function openMatchDetail(game: RecentGame) {
 
                 <div class="stat-cell">
                   <strong :class="{ leader: detailStatLeader(player, 'damage') }">
-                    {{ kNumber(player.damageToChampions) }}<em>{{ shareSuffix(player.damageToChampions, player.teamDamageToChampions) }}</em>
+                    {{ kNumber(player.damageToChampions) }}<em class="damage-sub">
+                      <span>{{ shareSuffix(player.damageToChampions, player.teamDamageToChampions) }}</span>
+                      <b class="bull-chip" :class="`bull-${bullOf(player).tier}`" :title="bullTitle(player)">{{ bullOf(player).label }}</b>
+                    </em>
                   </strong>
                 </div>
 
@@ -745,6 +785,28 @@ async function openMatchDetail(game: RecentGame) {
 
 .record-row.lose .queue-name {
   color: #ca4b4b;
+}
+
+.premade-start-tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+  padding: 4px 8px;
+  white-space: nowrap;
+}
+
+.premade-start-tag.solo {
+  color: #245f4f;
+  background: rgba(93, 176, 141, 0.18);
+}
+
+.premade-start-tag.premade {
+  color: #8a4b13;
+  background: rgba(236, 171, 74, 0.24);
 }
 
 .accolade-tags {
@@ -1270,6 +1332,37 @@ async function openMatchDetail(game: RecentGame) {
 .detail-row .stat-cell strong.leader em {
   color: inherit;
   font-weight: 900;
+}
+
+.detail-row .stat-cell strong em.damage-sub {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.bull-chip {
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 900;
+  font-style: normal;
+  line-height: 1;
+  padding: 2px 4px;
+  white-space: nowrap;
+}
+
+.bull-chip.bull-bull {
+  color: #5d3300;
+  background: linear-gradient(135deg, #ffe08a, #ffb03a);
+}
+
+.bull-chip.bull {
+  color: #145b3e;
+  background: #d9f1e1;
+}
+
+.bull-chip.bull-none {
+  color: #7a4323;
+  background: #f3e3d2;
 }
 
 .detail-score-cell {

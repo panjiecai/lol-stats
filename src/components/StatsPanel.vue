@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, inject, nextTick, onBeforeUnmount, ref, watch } from "vue"
-import { ArrowDown, ArrowUp, ChevronsUpDown, ClipboardCopy, Sparkles } from "lucide-vue-next"
+import { ArrowDown, ArrowUp, ChevronsUpDown, ClipboardCopy, LoaderCircle, RefreshCw, Sparkles } from "lucide-vue-next"
 import {
   calculateAugmentStats,
   calculateEquipmentStats,
@@ -18,13 +18,22 @@ import {
 } from "../funStats"
 import { copyElementAsPng } from "../imageShare"
 import { notifyKey } from "../notifications"
-import { getPlayerEloEstimateTask, startPlayerEloEstimateTask } from "../api"
+import {
+  debugExternalPlayerEloLookup,
+  getPlayerEloEstimateTask,
+  searchPlayer,
+  startPlayerEloEstimateTask,
+} from "../api"
 import type {
   ChampionSummaryItem,
+  ExternalEloLookupDebugResponse,
   GameAssetBundle,
   OpenMatchPayload,
+  PlayerEloGameLog,
   PlayerEloEstimateResponse,
+  PlayerEloScanGame,
   PlayerEloEstimateTaskStatus,
+  PlayerEloTraceParticipant,
   PlayerStatsResponse,
   RecentGame,
   RecentGameParticipantSummary,
@@ -32,6 +41,7 @@ import type {
 } from "../types"
 import AssetIcon from "./AssetIcon.vue"
 import ChampionAvatar from "./ChampionAvatar.vue"
+import AugmentComboFinder from "./AugmentComboFinder.vue"
 import FunStatsPanel from "./FunStatsPanel.vue"
 import GameRecordList from "./GameRecordList.vue"
 import {
@@ -44,6 +54,14 @@ import { championName, fixed, mitigationValue, percent, teamMitigationValue } fr
 
 const DATA_FILTER_HINT_SEEN_KEY = "lol-stats.data-filter-hint-seen"
 const PLAYER_ELO_POLL_INTERVAL_MS = 1200
+const SOLO_PEAK_SAMPLE_LIMIT = 20
+const SOLO_PEAK_CACHE_KEY = "lol-stats.solo-peak-profile"
+const SOLO_PEAK_PLAYER_SCORE_CACHE_KEY = "lol-stats.player-overall-score"
+const PLAYER_SCORE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const PLAYER_ABILITY_SCAN_DEPTH = 150
+const PLAYER_ABILITY_DISPLAY_DEPTH = 100
+const PLAYER_ABILITY_CONCURRENCY = 3
+const MIN_VALID_GAME_DURATION_SECONDS = 8 * 60
 
 type StatsTableTab =
   | "champion"
@@ -54,6 +72,18 @@ type StatsTableTab =
   | "allyChampion"
   | "enemyChampion"
 type SortDirection = "asc" | "desc"
+type SoloPeakProfileResult = {
+  games: number
+  averageScore: number
+  medianScore: number
+}
+type SoloPeakProfileCache = {
+  sgpServerId: string
+  summonerPuuid: string
+  dateKey: string
+  updatedAtMs: number
+  result: SoloPeakProfileResult
+}
 type ChampionSortKey =
   | "wilsonScore"
   | "name"
@@ -161,21 +191,33 @@ const encounterSort = ref<{ key: UsageSortKey; direction: SortDirection }>({
 })
 const shareBusy = ref<"champions" | "games" | null>(null)
 const statsRootRef = ref<HTMLElement | null>(null)
+const overviewMainRef = ref<HTMLElement | null>(null)
+const roleBarPanelRef = ref<HTMLElement | null>(null)
 const tableWrapRef = ref<HTMLElement | null>(null)
 const championStatsCaptureRef = ref<HTMLElement | null>(null)
 const championGamesCaptureRef = ref<HTMLElement | null>(null)
 const funStatsResult = ref<FunStatsResult | null>(null)
 const funStatsVisible = ref(false)
+const augmentComboVisible = ref(false)
 const funStatsLoading = ref(false)
 const playerEloEstimate = ref<PlayerEloEstimateResponse | null>(null)
+const playerEloPreviousEstimate = ref<PlayerEloEstimateResponse | null>(null)
 const playerEloLoading = ref(false)
 const playerEloError = ref("")
+const playerEloProgressMessage = ref("")
+const playerEloLogExpanded = ref(false)
+const playerEloExternalDebug = ref<ExternalEloLookupDebugResponse | null>(null)
+const playerEloExternalDebugLoading = ref(false)
+const playerEloExternalDebugError = ref("")
 const dataFilterHintVisible = ref(localStorage.getItem(DATA_FILTER_HINT_SEEN_KEY) !== "1")
+const roleBarPanelHeight = ref<number | null>(null)
 const notify = inject(notifyKey, () => 0)
 let savedTableScrollTop = 0
 let savedPageScrollTop = 0
 let playerEloRequestToken = 0
 let playerEloPollTimer: number | null = null
+let overviewMainResizeObserver: ResizeObserver | null = null
+let roleBarResizeListenerBound = false
 const selectedChampionGames = computed(() => {
   if (!selectedChampionId.value) return []
   return props.stats?.recentGames.filter((game) => game.championId === selectedChampionId.value) || []
@@ -273,6 +315,13 @@ const ratingContext = computed(() => ({
 const playerProfile = computed(() =>
   buildPlayerProfile(props.stats?.recentGames || [], ratingContext.value),
 )
+const soloPeakProfile = ref<SoloPeakProfileResult | null>(null)
+const soloPeakProfileLoading = ref(false)
+const soloPeakProfileError = ref("")
+const soloPeakProfileEmpty = ref(false)
+const soloPeakProfileProgress = ref({ players: 0, total: 0 })
+const soloPeakProfileUpdatedAt = ref("")
+let soloPeakRequestToken = 0
 const championProfileMap = computed(() =>
   buildChampionProfiles(props.stats?.recentGames || [], ratingContext.value).reduce<
     Record<number, ReturnType<typeof buildChampionProfiles>[number]>
@@ -402,6 +451,37 @@ function roleBarLabel(label: string) {
   return ["战士", "刺客", "纯刺客", "战士刺客", "半肉刺客"].includes(label) ? "战刺" : label
 }
 
+function syncRoleBarPanelHeight() {
+  const overviewMainEl = overviewMainRef.value
+  const roleBarEl = roleBarPanelRef.value
+  if (!overviewMainEl || !roleBarEl || window.innerWidth <= 1050) {
+    roleBarPanelHeight.value = null
+    return
+  }
+
+  const nextHeight = Math.ceil(overviewMainEl.getBoundingClientRect().height)
+  roleBarPanelHeight.value = nextHeight > 0 ? nextHeight : null
+}
+
+function bindOverviewMainHeightSync() {
+  if (!roleBarResizeListenerBound) {
+    window.addEventListener("resize", syncRoleBarPanelHeight)
+    roleBarResizeListenerBound = true
+  }
+
+  overviewMainResizeObserver?.disconnect()
+  overviewMainResizeObserver = null
+
+  if (typeof ResizeObserver === "undefined" || !overviewMainRef.value) {
+    return
+  }
+
+  overviewMainResizeObserver = new ResizeObserver(() => {
+    syncRoleBarPanelHeight()
+  })
+  overviewMainResizeObserver.observe(overviewMainRef.value)
+}
+
 watch(
   () => props.stats,
   () => {
@@ -410,15 +490,55 @@ watch(
     championSearch.value = ""
     funStatsResult.value = null
     funStatsVisible.value = false
+    augmentComboVisible.value = false
     playerEloEstimate.value = null
+    playerEloPreviousEstimate.value = null
     playerEloError.value = ""
+    playerEloProgressMessage.value = ""
+    playerEloLogExpanded.value = false
+    playerEloExternalDebug.value = null
+    playerEloExternalDebugError.value = ""
+    playerEloExternalDebugLoading.value = false
   },
+)
+
+watch(
+  () => [
+    props.stats?.summoner.puuid,
+    playerProfile.value.games,
+    playerProfile.value.tags.length,
+    abilityCards.value.length,
+    roleBars.value.length,
+    overviewMainRef.value,
+    roleBarPanelRef.value,
+  ],
+  async () => {
+    await nextTick()
+    bindOverviewMainHeightSync()
+    syncRoleBarPanelHeight()
+  },
+  { immediate: true },
 )
 
 watch(
   () => [props.stats?.summoner.puuid, props.stats?.summoner.gameName, props.stats?.summoner.tagLine, props.sgpServerId],
   () => {
     void refreshPlayerEloEstimate()
+  },
+  { immediate: true },
+)
+
+watch(
+  () => {
+    const games = props.stats?.recentGames || []
+    return games.length
+      ? `${games.length}:${games[0]?.gameId}:${props.sgpServerId || ""}`
+      : ""
+  },
+  () => {
+    soloPeakProfile.value = null
+    soloPeakProfileEmpty.value = false
+    void loadSoloPeakProfileStats()
   },
   { immediate: true },
 )
@@ -437,6 +557,11 @@ async function refreshPlayerEloEstimateInternal(forceRefresh: boolean) {
     stopPlayerEloPolling()
     playerEloEstimate.value = null
     playerEloError.value = ""
+    playerEloProgressMessage.value = ""
+    playerEloLogExpanded.value = false
+    playerEloExternalDebug.value = null
+    playerEloExternalDebugError.value = ""
+    playerEloExternalDebugLoading.value = false
     return
   }
 
@@ -444,6 +569,11 @@ async function refreshPlayerEloEstimateInternal(forceRefresh: boolean) {
   stopPlayerEloPolling()
   playerEloLoading.value = true
   playerEloError.value = ""
+  playerEloProgressMessage.value = forceRefresh ? "正在清缓存并重新计算角色 ELO" : "正在启动角色 ELO 计算"
+  playerEloExternalDebugError.value = ""
+  if (forceRefresh && playerEloEstimate.value) {
+    playerEloPreviousEstimate.value = playerEloEstimate.value
+  }
 
   try {
     const task = await startPlayerEloEstimateTask(
@@ -457,12 +587,8 @@ async function refreshPlayerEloEstimateInternal(forceRefresh: boolean) {
     await handlePlayerEloTaskStatus(task, requestToken, forceRefresh)
   } catch (error) {
     if (requestToken !== playerEloRequestToken) return
-    playerEloEstimate.value = null
+    playerEloLoading.value = false
     playerEloError.value = errorMessage(error)
-  } finally {
-    if (requestToken === playerEloRequestToken) {
-      playerEloLoading.value = false
-    }
   }
 }
 
@@ -474,14 +600,31 @@ async function handlePlayerEloTaskStatus(
   if (requestToken !== playerEloRequestToken) return
 
   if (task.result) {
+    if (!playerEloPreviousEstimate.value && task.status !== "completed") {
+      playerEloPreviousEstimate.value = task.result
+    }
+    if (
+      playerEloEstimate.value &&
+      playerEloEstimate.value !== task.result &&
+      playerEloEstimate.value.finalElo !== task.result.finalElo
+    ) {
+      playerEloPreviousEstimate.value = playerEloEstimate.value
+    }
     playerEloEstimate.value = task.result
   }
+  playerEloProgressMessage.value = task.message || ""
 
   if (task.status === "completed") {
     playerEloError.value = ""
     playerEloLoading.value = false
     stopPlayerEloPolling()
-    if (forceRefresh) {
+    if (task.message.includes("后台第") || task.message.includes("后台重试成功")) {
+      notify({
+        kind: "success",
+        title: "角色 ELO 后台更新成功",
+        message: "外部站点恢复返回后，角色 ELO 已自动刷新",
+      })
+    } else if (forceRefresh) {
       notify({
         kind: "success",
         title: "角色 ELO 已刷新",
@@ -494,19 +637,28 @@ async function handlePlayerEloTaskStatus(
   if (task.status === "failed") {
     playerEloLoading.value = false
     playerEloError.value = task.error || "角色 ELO 计算失败"
-    if (!task.result) {
-      playerEloEstimate.value = null
-    }
     stopPlayerEloPolling()
+    return
+  }
+
+  if (task.status === "retrying") {
+    playerEloLoading.value = true
+    playerEloError.value = ""
+    schedulePlayerEloPoll(task.jobId, requestToken, forceRefresh, task.nextPollDelayMs)
     return
   }
 
   playerEloLoading.value = true
   playerEloError.value = ""
-  schedulePlayerEloPoll(task.jobId, requestToken, forceRefresh)
+  schedulePlayerEloPoll(task.jobId, requestToken, forceRefresh, task.nextPollDelayMs)
 }
 
-function schedulePlayerEloPoll(jobId: string, requestToken: number, forceRefresh: boolean) {
+function schedulePlayerEloPoll(
+  jobId: string,
+  requestToken: number,
+  forceRefresh: boolean,
+  nextPollDelayMs?: number,
+) {
   stopPlayerEloPolling()
   playerEloPollTimer = window.setTimeout(async () => {
     try {
@@ -518,7 +670,7 @@ function schedulePlayerEloPoll(jobId: string, requestToken: number, forceRefresh
       playerEloError.value = errorMessage(error)
       stopPlayerEloPolling()
     }
-  }, PLAYER_ELO_POLL_INTERVAL_MS)
+  }, nextPollDelayMs && nextPollDelayMs > 0 ? nextPollDelayMs : PLAYER_ELO_POLL_INTERVAL_MS)
 }
 
 function stopPlayerEloPolling() {
@@ -529,7 +681,14 @@ function stopPlayerEloPolling() {
 }
 
 onBeforeUnmount(() => {
+  soloPeakRequestToken += 1
   stopPlayerEloPolling()
+  overviewMainResizeObserver?.disconnect()
+  overviewMainResizeObserver = null
+  if (roleBarResizeListenerBound) {
+    window.removeEventListener("resize", syncRoleBarPanelHeight)
+    roleBarResizeListenerBound = false
+  }
 })
 
 async function toggleFunStats() {
@@ -546,6 +705,14 @@ async function toggleFunStats() {
   funStatsVisible.value = true
   if (funStatsResult.value) return
   await loadFunStats(false)
+}
+
+function toggleAugmentCombo() {
+  if (augmentComboVisible.value) {
+    augmentComboVisible.value = false
+    return
+  }
+  augmentComboVisible.value = true
 }
 
 async function loadFunStats(force: boolean) {
@@ -700,6 +867,8 @@ function queueName(game: RecentGame) {
     1712: "斗魂竞技场",
     1900: "无限火力",
     2400: "海克斯大乱斗",
+    2410: "海斗大赛",
+    2450: "海克斯大乱斗",
   }
 
   return map[game.queueId] || game.gameMode || `队列 ${game.queueId}`
@@ -745,6 +914,311 @@ function ratio(part: number, total: number) {
 
 function scoreText(score: number, games: number) {
   return games > 0 ? `${Math.round(score)}分` : "样本不足"
+}
+
+function averageOfScores(values: number[]) {
+  if (!values.length) return 0
+  const total = values.reduce((sum, value) => sum + value, 0)
+  return Math.round((total / values.length) * 10) / 10
+}
+
+function medianOfScores(values: number[]) {
+  if (!values.length) return 0
+  const sorted = [...values].sort((left, right) => left - right)
+  const middle = Math.floor(sorted.length / 2)
+  const value =
+    sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
+  return Math.round(value * 10) / 10
+}
+
+async function loadSoloPeakProfileStats(force = false) {
+  const games = (props.stats?.recentGames || [])
+    .filter((game) => isSoloStartEligible(game))
+    .slice(0, SOLO_PEAK_SAMPLE_LIMIT)
+  if (soloPeakProfileLoading.value) return
+
+  if (!games.length) {
+    soloPeakProfile.value = null
+    soloPeakProfileError.value = ""
+    soloPeakProfileUpdatedAt.value = ""
+    soloPeakProfileEmpty.value = true
+    return
+  }
+  soloPeakProfileEmpty.value = false
+
+  if (!force) {
+    const cached = readSoloPeakProfileCache()
+    if (cached) {
+      soloPeakProfile.value = cached.result
+      soloPeakProfileError.value = ""
+      soloPeakProfileUpdatedAt.value = soloPeakUpdatedAtText(cached.updatedAtMs)
+      return
+    }
+  }
+
+  const requestToken = ++soloPeakRequestToken
+  soloPeakProfileLoading.value = true
+  soloPeakProfileError.value = ""
+  soloPeakProfileProgress.value = { players: 0, total: 0 }
+  soloPeakProfileUpdatedAt.value = ""
+
+  try {
+    const playersByGame = games.map((game) => ({
+      game,
+      players: [...(game.allyPlayers || []), ...(game.enemyPlayers || [])].filter(
+        (player) => player.puuid?.trim(),
+      ),
+    }))
+    const puuids = Array.from(
+      new Set(playersByGame.flatMap((entry) => entry.players.map((player) => player.puuid))),
+    )
+    soloPeakProfileProgress.value.total = puuids.length
+
+    const scoreByPuuid = new Map<string, number>()
+    let processed = 0
+    await runWithConcurrency(puuids, PLAYER_ABILITY_CONCURRENCY, async (puuid) => {
+      if (requestToken !== soloPeakRequestToken) return
+      const sourceGame = playersByGame.find((entry) =>
+        entry.players.some((player) => player.puuid === puuid),
+      )?.game
+      const score = sourceGame ? await loadPlayerOverallScore(puuid, sourceGame) : null
+      if (score !== null) scoreByPuuid.set(puuid, score)
+      processed += 1
+      soloPeakProfileProgress.value.players = processed
+    })
+    if (requestToken !== soloPeakRequestToken) return
+
+    const gameMaxes = playersByGame
+      .map(({ players }) => {
+        const scores = players
+          .map((player) => scoreByPuuid.get(player.puuid))
+          .filter((score): score is number => score !== undefined)
+        return scores.length ? Math.max(...scores) : null
+      })
+      .filter((score): score is number => score !== null)
+
+    if (!gameMaxes.length) {
+      soloPeakProfile.value = null
+      soloPeakProfileError.value = "未能读取到单人开局对局里的玩家综合分"
+      return
+    }
+
+    soloPeakProfile.value = {
+      games: gameMaxes.length,
+      averageScore: averageOfScores(gameMaxes),
+      medianScore: medianOfScores(gameMaxes),
+    }
+    soloPeakProfileUpdatedAt.value = "刚刚更新"
+    writeSoloPeakProfileCache(soloPeakProfile.value)
+  } catch (error) {
+    if (requestToken !== soloPeakRequestToken) return
+    soloPeakProfileError.value = errorMessage(error)
+  } finally {
+    if (requestToken === soloPeakRequestToken) {
+      soloPeakProfileLoading.value = false
+    }
+  }
+}
+
+async function refreshSoloPeakProfile() {
+  await loadSoloPeakProfileStats(true)
+}
+
+function soloPeakCacheIdentity() {
+  return {
+    sgpServerId: props.sgpServerId || "",
+    summonerPuuid: props.stats?.summoner.puuid || "",
+  }
+}
+
+function todayDateKey() {
+  const now = new Date()
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+    now.getDate(),
+  ).padStart(2, "0")}`
+}
+
+function readSoloPeakProfileCache() {
+  const identity = soloPeakCacheIdentity()
+  if (!identity.summonerPuuid) return null
+  try {
+    const raw = localStorage.getItem(SOLO_PEAK_CACHE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as SoloPeakProfileCache
+    if (
+      !parsed ||
+      !parsed.result ||
+      !Number.isFinite(parsed.result.averageScore) ||
+      !Number.isFinite(parsed.result.medianScore) ||
+      parsed.sgpServerId !== identity.sgpServerId ||
+      parsed.summonerPuuid !== identity.summonerPuuid ||
+      parsed.dateKey !== todayDateKey()
+    ) {
+      return null
+    }
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+function writeSoloPeakProfileCache(result: SoloPeakProfileResult) {
+  const identity = soloPeakCacheIdentity()
+  if (!identity.summonerPuuid) return
+  try {
+    const payload: SoloPeakProfileCache = {
+      sgpServerId: identity.sgpServerId,
+      summonerPuuid: identity.summonerPuuid,
+      dateKey: todayDateKey(),
+      updatedAtMs: Date.now(),
+      result,
+    }
+    localStorage.setItem(SOLO_PEAK_CACHE_KEY, JSON.stringify(payload))
+  } catch {
+    /* 缓存写入失败不影响展示 */
+  }
+}
+
+function soloPeakUpdatedAtText(updatedAtMs: number) {
+  const now = new Date()
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  if (updatedAtMs >= startOfToday) return "今日已更新"
+  const diffDays = Math.floor((startOfToday - updatedAtMs) / 86400000)
+  return diffDays <= 1 ? "昨日更新" : `${diffDays} 天前更新`
+}
+
+async function loadPlayerOverallScore(puuid: string, sourceGame: RecentGame) {
+  const cachedScore = readPlayerScoreCache(puuid, sourceGame)
+  if (cachedScore !== null) return cachedScore
+
+  try {
+    const stats = await searchPlayer(
+      puuid,
+      PLAYER_ABILITY_SCAN_DEPTH,
+      props.sgpServerId,
+      false,
+      false,
+    )
+    const games = stats.recentGames
+      .filter(
+        (game) =>
+          game.gameDuration >= MIN_VALID_GAME_DURATION_SECONDS &&
+          abilityQueueMatches(game, sourceGame),
+      )
+      .slice(0, PLAYER_ABILITY_DISPLAY_DEPTH)
+    const profile = buildPlayerProfile(games, ratingContext.value)
+    const score = profile.games > 0 ? profile.overallScore : null
+    if (score !== null) writePlayerScoreCache(puuid, sourceGame, score)
+    return score
+  } catch {
+    return null
+  }
+}
+
+function queueFamilyOf(game: RecentGame) {
+  const queueId = game.queueId
+  const gameMode = game.gameMode || ""
+  if (isHexAram(queueId, gameMode)) return "hexaram"
+  if (queueId === 450 || gameMode === "ARAM") return "aram"
+  if ([420, 440].includes(queueId)) return "ranked"
+  if ([400, 430, 490].includes(queueId) || gameMode === "CLASSIC") return "classic"
+  return "other"
+}
+
+function playerScoreCacheKey(puuid: string, sourceGame: RecentGame) {
+  return `${puuid}:${props.sgpServerId || ""}:${queueFamilyOf(sourceGame)}`
+}
+
+function readPlayerScoreCache(puuid: string, sourceGame: RecentGame) {
+  try {
+    const raw = localStorage.getItem(SOLO_PEAK_PLAYER_SCORE_CACHE_KEY)
+    if (!raw) return null
+    const map = JSON.parse(raw) as Record<string, { updatedAtMs: number; score: number }>
+    const entry = map[playerScoreCacheKey(puuid, sourceGame)]
+    if (!entry) return null
+    if (Date.now() - entry.updatedAtMs > PLAYER_SCORE_CACHE_TTL_MS) return null
+    return entry.score
+  } catch {
+    return null
+  }
+}
+
+function writePlayerScoreCache(puuid: string, sourceGame: RecentGame, score: number) {
+  try {
+    const raw = localStorage.getItem(SOLO_PEAK_PLAYER_SCORE_CACHE_KEY)
+    const map = raw
+      ? (JSON.parse(raw) as Record<string, { updatedAtMs: number; score: number }>)
+      : {}
+    map[playerScoreCacheKey(puuid, sourceGame)] = { updatedAtMs: Date.now(), score }
+    localStorage.setItem(SOLO_PEAK_PLAYER_SCORE_CACHE_KEY, JSON.stringify(map))
+  } catch {
+    /* 缓存写入失败不影响展示 */
+  }
+}
+
+function abilityQueueMatches(game: RecentGame, source: RecentGame) {
+  const queueId = source.queueId
+  const gameMode = source.gameMode || ""
+
+  if (isHexAram(queueId, gameMode)) return isHexAram(game.queueId, game.gameMode)
+
+  if (queueId === 450 || gameMode === "ARAM") {
+    return (
+      !isHexAram(game.queueId, game.gameMode) &&
+      (game.queueId === 450 || game.gameMode === "ARAM")
+    )
+  }
+
+  if ([420, 440].includes(queueId)) {
+    return [420, 440].includes(game.queueId)
+  }
+
+  if ([400, 430, 490].includes(queueId) || gameMode === "CLASSIC") {
+    return (
+      [400, 420, 430, 440, 490].includes(game.queueId) ||
+      (game.gameMode === "CLASSIC" &&
+        ![450, 1700, 1710, 1711, 1712, 2400].includes(game.queueId))
+    )
+  }
+
+  return true
+}
+
+function isHexAram(queueId: number, gameMode: string) {
+  return queueId === 2400 || ["STRAWBERRY", "KIWI"].includes(gameMode.toUpperCase())
+}
+
+function isSoloStartEligible(game: RecentGame) {
+  if ((game.premadeTeammatePuuids?.length || 0) !== 0) return false
+  return isClassicQueue(game)
+}
+
+function isClassicQueue(game: RecentGame) {
+  const queueId = game.queueId
+  const gameMode = (game.gameMode || "").toUpperCase()
+  if (isHexAram(queueId, gameMode)) return false
+  if (queueId === 450 || gameMode === "ARAM") return false
+  if ([1700, 1710, 1711, 1712].includes(queueId)) return false
+  if ([900, 1900].includes(queueId)) return false
+  if (gameMode === "CLASSIC") return true
+  return [400, 420, 430, 440, 490].includes(queueId)
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+) {
+  let index = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (index < items.length) {
+      const item = items[index]
+      index += 1
+      await worker(item)
+    }
+  })
+
+  await Promise.all(workers)
 }
 
 function profileLevelClass(score: number, games: number) {
@@ -1467,6 +1941,11 @@ function durationText(seconds: number) {
 }
 
 function playerEloSummaryText() {
+  if (playerEloLoading.value && playerEloEstimate.value && playerEloProgressMessage.value) {
+    return `${playerEloProgressMessage.value}（当前先显示已拿到的结果）`
+  }
+  if (playerEloLoading.value && playerEloEstimate.value) return "后台重算中，当前先显示已拿到的结果"
+  if (playerEloLoading.value && playerEloProgressMessage.value) return playerEloProgressMessage.value
   if (playerEloLoading.value) return "后台计算中，结果会自动刷新"
   if (playerEloEstimate.value) {
     return `样本 ${playerEloEstimate.value.sampleGames} 局，去极值后 ${playerEloEstimate.value.trimmedGames} 局`
@@ -1478,6 +1957,78 @@ function playerEloSummaryText() {
 function playerEloDetailText() {
   if (!playerEloEstimate.value) return "最近最多 10 局单人开局，每局取单人玩家最高 ELO"
   return `均值 ${fixed(playerEloEstimate.value.averageElo, 1)} · 中位 ${fixed(playerEloEstimate.value.medianElo, 1)}`
+}
+
+function playerEloValueText() {
+  if (playerEloEstimate.value) return fixed(playerEloEstimate.value.finalElo, 1)
+  return playerEloLoading.value ? "计算中..." : "--"
+}
+
+function playerEloPreviousText() {
+  const previous = playerEloPreviousEstimate.value
+  if (!previous) return ""
+  return `上次 ELO ${fixed(previous.finalElo, 1)}`
+}
+
+function playerEloLogMeta(game: PlayerEloScanGame | PlayerEloGameLog) {
+  const time = `${monthDayText(game.gameCreation)} ${hourMinuteText(game.gameCreation)}`
+  const champion = championName(props.champions, game.championId)
+  const mode = game.gameMode || (game.queueId ? `队列 ${game.queueId}` : "未知模式")
+  return `${time} · ${champion} · ${mode}`
+}
+
+function playerEloScanCountText() {
+  const estimate = playerEloEstimate.value
+  if (!estimate) return playerEloLoading.value ? "计算中" : "等待结果"
+  const soloGames = estimate.scanGames.filter((game) => game.isSoloGame).length
+  return `扫描 ${estimate.scanGames.length} 局，命中 ${soloGames} 局单人开局`
+}
+
+function playerEloLogCountText() {
+  const estimate = playerEloEstimate.value
+  if (!estimate) return playerEloLoading.value ? "等待后台返回明细" : "暂无明细"
+  const included = estimate.gameLogs.filter((game) => game.included).length
+  return `${estimate.gameLogs.length} 局候选，计入 ${included} 局`
+}
+
+function playerEloLogCollapsedText() {
+  if (playerEloError.value) return playerEloError.value
+  if (playerEloProgressMessage.value) return playerEloProgressMessage.value
+  if (playerEloEstimate.value) return "点击展开查看单人开局扫描、样本局明细和逐人 ELO 命中"
+  return "算分完成后可展开查看逐局命中过程"
+}
+
+function playerEloLogStatusText(game: PlayerEloGameLog) {
+  return game.included ? "计入" : "丢弃"
+}
+
+function playerEloParticipantValue(player: PlayerEloTraceParticipant) {
+  return player.elo === null ? "--" : fixed(player.elo, 1)
+}
+
+function playerEloDiagnosticRiotId() {
+  const summoner = props.stats?.summoner
+  if (!summoner) return ""
+  if (summoner.gameName?.trim() && summoner.tagLine?.trim()) {
+    return `${summoner.gameName.trim()}#${summoner.tagLine.trim()}`
+  }
+  return summoner.displayName?.trim() || ""
+}
+
+async function runPlayerEloExternalDebug() {
+  const riotId = playerEloDiagnosticRiotId()
+  const sgpServerId = props.sgpServerId?.trim()
+  if (!riotId || !sgpServerId || playerEloExternalDebugLoading.value) return
+
+  playerEloExternalDebugLoading.value = true
+  playerEloExternalDebugError.value = ""
+  try {
+    playerEloExternalDebug.value = await debugExternalPlayerEloLookup(riotId, sgpServerId)
+  } catch (error) {
+    playerEloExternalDebugError.value = errorMessage(error)
+  } finally {
+    playerEloExternalDebugLoading.value = false
+  }
 }
 
 function isGameLeader(
@@ -1572,26 +2123,181 @@ function errorMessage(error: unknown) {
       >
         <div class="metric-head">
           <span>角色 ELO</span>
-          <button
-            class="metric-action"
-            type="button"
-            :disabled="playerEloLoading"
-            @click="refreshPlayerEloEstimateFromSource"
-          >
-            {{ playerEloLoading ? "刷新中..." : "清缓存刷新" }}
-          </button>
+          <div class="metric-actions">
+            <button
+              class="metric-action metric-action-secondary"
+              type="button"
+              :disabled="playerEloExternalDebugLoading || !stats?.summoner || !sgpServerId"
+              @click="runPlayerEloExternalDebug"
+            >
+              {{ playerEloExternalDebugLoading ? "诊断中..." : "外部诊断" }}
+            </button>
+            <button
+              class="metric-action"
+              type="button"
+              :disabled="playerEloLoading"
+              @click="refreshPlayerEloEstimateFromSource"
+            >
+              {{ playerEloLoading ? "刷新中..." : "清缓存刷新" }}
+            </button>
+          </div>
         </div>
         <div class="metric-elo-body">
-          <strong>{{ playerEloLoading ? "计算中..." : playerEloEstimate ? fixed(playerEloEstimate.finalElo, 1) : "--" }}</strong>
+          <strong>{{ playerEloValueText() }}</strong>
           <div class="metric-elo-meta">
             <small>{{ playerEloSummaryText() }}</small>
             <small>{{ playerEloDetailText() }}</small>
-            <small class="metric-note">成功结果缓存 1 天</small>
+            <small v-if="playerEloPreviousText()" class="metric-note">{{ playerEloPreviousText() }}</small>
+            <small class="metric-note">成功结果缓存 1 年，不点清缓存就持续沿用</small>
           </div>
+        </div>
+        <div class="metric-elo-log">
+          <div class="metric-elo-log-head">
+            <div>
+              <strong>计算日志</strong>
+              <small>{{ playerEloLogCountText() }}</small>
+            </div>
+            <button
+              class="metric-action metric-action-secondary metric-elo-log-toggle"
+              type="button"
+              :disabled="!playerEloEstimate && !playerEloLoading && !playerEloError && !playerEloProgressMessage"
+              @click="playerEloLogExpanded = !playerEloLogExpanded"
+            >
+              {{ playerEloLogExpanded ? "收起日志" : "展开日志" }}
+            </button>
+          </div>
+
+          <div v-if="!playerEloLogExpanded" class="metric-elo-log-collapsed">
+            <strong>{{ playerEloLoading ? "日志已收起" : "日志默认收起" }}</strong>
+            <small>{{ playerEloLogCollapsedText() }}</small>
+          </div>
+
+          <div class="metric-elo-log-grid" v-else-if="playerEloEstimate">
+            <section class="elo-log-block">
+              <header class="elo-log-block-head">
+                <strong>单人开局扫描</strong>
+                <span>{{ playerEloScanCountText() }}</span>
+              </header>
+              <article
+                v-for="game in playerEloEstimate.scanGames"
+                :key="`scan-${game.gameId}`"
+                :class="['elo-scan-row', game.isSoloGame ? 'is-hit' : 'is-skip']"
+              >
+                <div class="elo-scan-top">
+                  <strong>#{{ game.gameId }}</strong>
+                  <span>{{ game.isSoloGame ? "单人开局" : "非单人开局" }}</span>
+                </div>
+                <small>{{ playerEloLogMeta(game) }}</small>
+                <p>{{ game.note }}</p>
+              </article>
+            </section>
+
+            <section class="elo-log-block">
+              <header class="elo-log-block-head">
+                <strong>样本局明细</strong>
+                <span>{{ playerEloEstimate.rawGameMaxElos.join(" / ") || "--" }}</span>
+              </header>
+              <article
+                v-for="game in playerEloEstimate.gameLogs"
+                :key="`log-${game.gameId}`"
+                :class="['elo-game-log', game.included ? 'is-included' : 'is-dropped']"
+              >
+                <div class="elo-game-log-head">
+                  <div>
+                    <strong>#{{ game.gameId }}</strong>
+                    <small>{{ playerEloLogMeta(game) }}</small>
+                  </div>
+                  <div class="elo-game-log-side">
+                    <span class="elo-log-badge">{{ playerEloLogStatusText(game) }}</span>
+                    <b>{{ game.maxElo === null ? "--" : fixed(game.maxElo, 1) }}</b>
+                  </div>
+                </div>
+                <p class="elo-game-log-note">{{ game.note }}</p>
+
+                <div class="elo-trace-list">
+                  <div
+                    v-for="player in game.players"
+                    :key="`${game.gameId}-${player.side}-${player.puuid || player.summonerName}`"
+                    :class="['elo-trace-row', player.included ? 'is-hit' : 'is-miss', player.side === '自己' ? 'is-owner' : '']"
+                  >
+                    <div class="elo-trace-main">
+                      <div class="elo-trace-name">
+                        <span class="elo-trace-side">{{ player.side }}</span>
+                        <strong>{{ player.summonerName }}</strong>
+                      </div>
+                      <small>{{ championName(champions, player.championId) }} · {{ player.note }}</small>
+                    </div>
+                    <div class="elo-trace-value">
+                      {{ playerEloParticipantValue(player) }}
+                    </div>
+                  </div>
+                </div>
+              </article>
+            </section>
+          </div>
+
+          <div v-else class="elo-log-empty metric-elo-inline-empty">
+            <strong>{{ playerEloLoading ? "后台计算中" : "暂无日志" }}</strong>
+            <small>{{ playerEloError || playerEloProgressMessage || "算分完成后会在这里展开每一局的命中过程" }}</small>
+          </div>
+
+          <section
+            v-if="playerEloExternalDebug || playerEloExternalDebugError || playerEloExternalDebugLoading"
+            class="elo-diagnostic-panel"
+          >
+            <header class="elo-diagnostic-head">
+              <div>
+                <strong>外部站点诊断</strong>
+                <small>
+                  {{
+                    playerEloExternalDebugLoading
+                      ? "正在直连外部接口"
+                      : playerEloExternalDebugError || playerEloExternalDebug?.note || "待诊断"
+                  }}
+                </small>
+              </div>
+            </header>
+
+            <div v-if="playerEloExternalDebug" class="elo-diagnostic-meta">
+              <span>目标 {{ playerEloExternalDebug.riotId }}</span>
+              <span>区服 {{ playerEloExternalDebug.areaName }}</span>
+              <span>info code {{ playerEloExternalDebug.infoCode || "--" }}</span>
+              <span>rank code {{ playerEloExternalDebug.rankCode || "--" }}</span>
+              <span>匹配 {{ playerEloExternalDebug.matchedRiotId || "--" }}</span>
+              <span>ELO {{ playerEloExternalDebug.elo === null ? "--" : fixed(playerEloExternalDebug.elo, 1) }}</span>
+              <span>文本 {{ playerEloExternalDebug.extractedRankText || "--" }}</span>
+            </div>
+
+            <div v-if="playerEloExternalDebugError" class="elo-diagnostic-error">
+              {{ playerEloExternalDebugError }}
+            </div>
+
+            <div v-if="playerEloExternalDebug" class="elo-diagnostic-grid">
+              <article class="elo-diagnostic-block">
+                <header>
+                  <strong>请求参数</strong>
+                </header>
+                <pre>{{ playerEloExternalDebug.infoRequestUrl || "--" }}</pre>
+                <pre>{{ playerEloExternalDebug.rankRequestUrl || "--" }}</pre>
+              </article>
+              <article class="elo-diagnostic-block">
+                <header>
+                  <strong>info 原始返回</strong>
+                </header>
+                <pre>{{ playerEloExternalDebug.infoPayload || "--" }}</pre>
+              </article>
+              <article class="elo-diagnostic-block">
+                <header>
+                  <strong>rank 原始返回</strong>
+                </header>
+                <pre>{{ playerEloExternalDebug.rankPayload || "--" }}</pre>
+              </article>
+            </div>
+          </section>
         </div>
       </div>
 
-      <div class="overview-main">
+      <div class="overview-main" ref="overviewMainRef">
         <div class="stats-owner-heading">
           <span>当前角色</span>
           <strong>{{ statsOwnerLabel }}</strong>
@@ -1678,10 +2384,66 @@ function errorMessage(error: unknown) {
               </footer>
             </article>
           </div>
+
+          <div class="solo-peak-block">
+            <header class="solo-peak-heading">
+              <div class="solo-peak-title">
+                <span>单人开局最高综合分</span>
+                <small>每局取全部玩家最高综合分，最近 {{ SOLO_PEAK_SAMPLE_LIMIT }} 场</small>
+              </div>
+              <div class="solo-peak-actions">
+                <small v-if="soloPeakProfileUpdatedAt" class="solo-peak-updated">
+                  {{ soloPeakProfileUpdatedAt }}
+                </small>
+                <button
+                  class="solo-peak-refresh"
+                  :disabled="soloPeakProfileLoading"
+                  @click="refreshSoloPeakProfile"
+                >
+                  <LoaderCircle v-if="soloPeakProfileLoading" class="spin" :size="13" />
+                  <RefreshCw v-else :size="13" />
+                  更新
+                </button>
+              </div>
+            </header>
+
+            <div class="solo-peak-state" v-if="soloPeakProfileLoading">
+              <LoaderCircle class="spin" :size="14" />
+              正在读取对局玩家综合分
+              <span v-if="soloPeakProfileProgress.total">
+                {{ soloPeakProfileProgress.players }}/{{ soloPeakProfileProgress.total }} 名玩家
+              </span>
+            </div>
+
+            <div class="solo-peak-state error" v-else-if="soloPeakProfileError">
+              {{ soloPeakProfileError }}
+            </div>
+
+            <div class="solo-peak-state" v-else-if="soloPeakProfileEmpty">
+              该账号近期没有单人开局对局
+            </div>
+
+            <div class="solo-peak-grid" v-else-if="soloPeakProfile">
+              <div class="solo-peak-metric">
+                <span>平均分</span>
+                <strong>{{ fixed(soloPeakProfile.averageScore, 1) }}分</strong>
+                <small>{{ soloPeakProfile.games }} 局样本</small>
+              </div>
+              <div class="solo-peak-metric">
+                <span>中位数</span>
+                <strong>{{ fixed(soloPeakProfile.medianScore, 1) }}分</strong>
+                <small>{{ soloPeakProfile.games }} 局样本</small>
+              </div>
+            </div>
+          </div>
         </section>
       </div>
 
-      <aside class="panel role-bar-panel">
+      <aside
+        ref="roleBarPanelRef"
+        class="panel role-bar-panel"
+        :style="roleBarPanelHeight ? { height: `${roleBarPanelHeight}px` } : undefined"
+      >
         <div class="role-bar-scroll">
           <div
             v-for="role in roleBars"
@@ -1716,6 +2478,16 @@ function errorMessage(error: unknown) {
         <Sparkles :size="16" />
         {{ funStatsLoading ? "统计中" : funStatsVisible ? "收起数据筛选" : "数据筛选" }}
       </button>
+      <button
+        class="data-filter-button"
+        type="button"
+        :disabled="stats.recentGames.length === 0"
+        @click="toggleAugmentCombo"
+      >
+        <span v-if="augmentComboVisible" class="data-filter-hint active" aria-hidden="true"></span>
+        <Sparkles :size="16" />
+        {{ augmentComboVisible ? "收起海克斯连号" : "海克斯连号检索" }}
+      </button>
     </div>
 
     <FunStatsPanel
@@ -1730,6 +2502,16 @@ function errorMessage(error: unknown) {
       @equipment-change="updateFunEquipment"
       @penetration-change="updateFunPenetration"
       @augment-change="updateFunAugment"
+    />
+
+    <AugmentComboFinder
+      v-if="!selectedChampionId && augmentComboVisible"
+      :stats="stats"
+      :champions="champions"
+      :game-assets="gameAssets"
+      :sgp-server-id="sgpServerId"
+      :owner-label="statsOwnerLabel"
+      @open-match="emit('openMatch', $event)"
     />
 
     <div class="content-grid">
@@ -2699,6 +3481,13 @@ function errorMessage(error: unknown) {
   gap: 8px;
 }
 
+.metric-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .metric span,
 .metric small {
   color: #6c7a80;
@@ -2725,6 +3514,17 @@ function errorMessage(error: unknown) {
 .metric-action:disabled {
   cursor: default;
   opacity: 0.6;
+}
+
+.metric-action-secondary {
+  border-color: rgba(44, 102, 148, 0.18);
+  background: rgba(44, 102, 148, 0.08);
+  color: #2c6694;
+}
+
+.metric-action-secondary:hover:not(:disabled) {
+  background: rgba(44, 102, 148, 0.14);
+  border-color: rgba(44, 102, 148, 0.28);
 }
 
 .metric strong {
@@ -2783,6 +3583,157 @@ function errorMessage(error: unknown) {
 
 .metric-note {
   margin-top: 2px;
+}
+
+.metric-elo-log {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+  border-top: 1px solid rgba(75, 63, 191, 0.12);
+  padding-top: 14px;
+}
+
+.metric-elo-log-head {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.metric-elo-log-head strong {
+  color: #20333a;
+  font-size: 15px;
+  font-weight: 950;
+}
+
+.metric-elo-log-head small {
+  color: #6c7a80;
+  font-size: 12px;
+}
+
+.metric-elo-log-toggle {
+  flex: 0 0 auto;
+}
+
+.metric-elo-log-collapsed {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-radius: 12px;
+  background: rgba(75, 63, 191, 0.05);
+  padding: 12px 14px;
+}
+
+.metric-elo-log-collapsed strong {
+  color: #20333a;
+  font-size: 14px;
+  font-weight: 900;
+}
+
+.metric-elo-log-collapsed small {
+  color: #66757c;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.metric-elo-log-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.metric-elo-inline-empty {
+  min-height: 120px;
+  padding: 0;
+}
+
+.elo-diagnostic-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border-top: 1px dashed rgba(75, 63, 191, 0.18);
+  padding-top: 14px;
+}
+
+.elo-diagnostic-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.elo-diagnostic-head strong {
+  color: #20333a;
+  font-size: 15px;
+  font-weight: 950;
+}
+
+.elo-diagnostic-head small {
+  color: #6c7a80;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.elo-diagnostic-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.elo-diagnostic-meta span {
+  border-radius: 999px;
+  background: rgba(75, 63, 191, 0.08);
+  color: #4b3fbf;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+  padding: 7px 10px;
+}
+
+.elo-diagnostic-error {
+  border-radius: 8px;
+  background: #fff1f1;
+  color: #a73a3a;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 10px 12px;
+}
+
+.elo-diagnostic-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.elo-diagnostic-block {
+  border-radius: 8px;
+  background: #f7fbfa;
+  padding: 12px;
+}
+
+.elo-diagnostic-block header {
+  margin-bottom: 8px;
+}
+
+.elo-diagnostic-block strong {
+  color: #20333a;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.elo-diagnostic-block pre {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  color: #43545b;
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .metric-avatar {
@@ -2935,26 +3886,149 @@ function errorMessage(error: unknown) {
   font-weight: 950;
 }
 
-.role-bar-panel {
-  contain: size;
-  align-self: start;
+.solo-peak-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-radius: 8px;
+  background: #f7fbfa;
+  padding: 11px 12px;
+}
+
+.solo-peak-state {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #5f7076;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.solo-peak-state span {
+  color: #8a989c;
+}
+
+.solo-peak-state.error {
+  color: #a94745;
+}
+
+.solo-peak-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.solo-peak-title {
+  display: flex;
   min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.solo-peak-title span {
+  color: #20333a;
+  font-size: 15px;
+  font-weight: 950;
+}
+
+.solo-peak-title small {
+  color: #718087;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.solo-peak-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.solo-peak-updated {
+  color: #8a989c;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.solo-peak-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 7px;
+  color: #315f58;
+  background: #e4f1ee;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 900;
+  padding: 6px 9px;
+}
+
+.solo-peak-refresh:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.solo-peak-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.solo-peak-metric {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 9px 11px;
+}
+
+.solo-peak-metric > span {
+  color: #718087;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.solo-peak-metric strong {
+  color: #20333a;
+  font-size: 22px;
+  font-weight: 950;
+  line-height: 1.15;
+}
+
+.solo-peak-metric small {
+  color: #8a989c;
+  font-size: 11.5px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.role-bar-panel {
+  display: flex;
+  align-self: start;
   min-height: 0;
-  height: 100%;
+  min-width: 0;
   overflow: hidden;
-  padding: 0;
+  padding: 12px;
 }
 
 .role-bar-scroll {
   display: flex;
-  width: 100%;
-  height: 100%;
+  flex: 1 1 auto;
+  width: auto;
   min-height: 0;
   flex-direction: column;
   gap: 12px;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 12px;
+  padding-right: 4px;
   scrollbar-gutter: stable;
   scrollbar-width: thin;
 }
@@ -3020,6 +4094,220 @@ function errorMessage(error: unknown) {
   font-size: 13px;
   font-weight: 900;
   white-space: nowrap;
+}
+
+.elo-log-block {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.elo-log-block-head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.elo-log-block-head strong {
+  color: #20333a;
+  font-size: 15px;
+  font-weight: 950;
+}
+
+.elo-log-block-head span {
+  color: #66757c;
+  font-size: 12px;
+  font-weight: 900;
+  text-align: right;
+}
+
+.elo-scan-row,
+.elo-game-log {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid #e0ebe8;
+  border-radius: 8px;
+  background: #fbfdfc;
+  padding: 10px;
+}
+
+.elo-scan-row.is-hit,
+.elo-game-log.is-included {
+  border-color: #d7d3ff;
+  background: #faf8ff;
+}
+
+.elo-scan-row.is-skip,
+.elo-game-log.is-dropped {
+  border-color: #e8dfd4;
+  background: #fffaf6;
+}
+
+.elo-scan-top,
+.elo-game-log-head {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.elo-scan-top strong,
+.elo-game-log-head strong {
+  color: #20333a;
+  font-size: 14px;
+  font-weight: 950;
+}
+
+.elo-scan-top span,
+.elo-game-log-head small,
+.elo-game-log-note,
+.elo-scan-row small,
+.elo-scan-row p {
+  color: #637278;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.elo-scan-row p,
+.elo-game-log-note {
+  margin: 0;
+}
+
+.elo-game-log-side {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.elo-game-log-side b {
+  color: #4b3fbf;
+  font-size: 18px;
+  font-weight: 950;
+  line-height: 1;
+}
+
+.elo-log-badge {
+  border-radius: 999px;
+  background: rgba(75, 63, 191, 0.1);
+  color: #4b3fbf;
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1;
+  padding: 5px 8px;
+  white-space: nowrap;
+}
+
+.elo-game-log.is-dropped .elo-log-badge {
+  background: rgba(170, 97, 28, 0.12);
+  color: #9a5b1e;
+}
+
+.elo-game-log.is-dropped .elo-game-log-side b {
+  color: #9a5b1e;
+}
+
+.elo-trace-list {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.elo-trace-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 8px 10px;
+}
+
+.elo-trace-row.is-hit {
+  background: #f3f0ff;
+}
+
+.elo-trace-row.is-miss {
+  background: #fff6ee;
+}
+
+.elo-trace-row.is-owner {
+  background: #f4f7f8;
+}
+
+.elo-trace-main {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.elo-trace-name {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.elo-trace-side {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: rgba(32, 51, 58, 0.08);
+  color: #495a61;
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1;
+  padding: 4px 7px;
+}
+
+.elo-trace-name strong {
+  overflow: hidden;
+  color: #20333a;
+  font-size: 13px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.elo-trace-main small {
+  color: #66757c;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.elo-trace-value {
+  flex: 0 0 auto;
+  color: #20333a;
+  font-size: 16px;
+  font-weight: 950;
+  line-height: 1;
+}
+
+.elo-log-empty {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+}
+
+.elo-log-empty strong {
+  color: #20333a;
+  font-size: 16px;
+  font-weight: 950;
+}
+
+.elo-log-empty small {
+  color: #66757c;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .tag-strong {
@@ -3106,7 +4394,9 @@ function errorMessage(error: unknown) {
 
 .fun-stats-entry {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-start;
+  gap: 8px;
 }
 
 .fun-stats-entry button {
@@ -3136,6 +4426,11 @@ function errorMessage(error: unknown) {
   border-radius: 50%;
   background: #e33c4e;
   box-shadow: 0 1px 5px rgb(205 37 55 / 35%);
+}
+
+.data-filter-hint.active {
+  background: #1f8a6f;
+  box-shadow: 0 1px 5px rgb(20 120 95 / 35%);
 }
 
 .fun-stats-entry button:hover:not(:disabled) {
@@ -3917,6 +5212,10 @@ td:first-child {
     align-items: start;
   }
 
+  .metric-elo-log-grid {
+    grid-template-columns: 1fr;
+  }
+
   .metric-elo-wide strong {
     font-size: 48px;
   }
@@ -3926,7 +5225,8 @@ td:first-child {
   }
 
   .profile-layout,
-  .ability-grid {
+  .ability-grid,
+  .solo-peak-grid {
     grid-template-columns: 1fr;
   }
 

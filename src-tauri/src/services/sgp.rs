@@ -7,12 +7,15 @@ use serde_json::Value;
 use super::error::{AppError, AppResult};
 use super::lcu::LcuClient;
 use super::models::{
-    ClientAuth, Game, GameTeam, IdentityPlayer, Participant, ParticipantIdentity, ParticipantStats,
-    ParticipantTimeline, RankedQueueEntry, RankedQueueMap, RankedStatsResponse, SummonerInfo,
+    ActiveGamePlayer, ActiveGameTeam, ClientAuth, Game, GameTeam, IdentityPlayer,
+    OfficialApiDebugResponse, OfficialApiProbeSample, Participant, ParticipantIdentity,
+    ParticipantStats, ParticipantTimeline, PlayerActiveGame, RankedQueueEntry, RankedQueueMap,
+    RankedStatsResponse, SummonerInfo,
 };
 
 const USER_AGENT: &str = "LeagueOfLegendsClient/14.13.596.7996 (rcp-be-lol-match-history)";
 const MAX_RETRIES: usize = 3;
+const OFFICIAL_PROBE_SAMPLE_COUNT: usize = 3;
 
 /// 国服 SGP（Service Gateway Proxy）深战绩客户端。
 ///
@@ -259,6 +262,183 @@ impl SgpClient {
 
         Ok(sgp_game_json_to_lcu_game(summary))
     }
+
+    /// 查询指定账号当前是否在游戏中（SGP 观战服务 `gsm/v1/ledge/spectator`）。
+    ///
+    /// 返回 404 表示该账号当前没有进行中的对局；成功则返回双方阵容与英雄信息。
+    pub async fn active_game_by_puuid(&self, puuid: &str) -> AppResult<PlayerActiveGame> {
+        let sub_id = self
+            .sgp_server_id
+            .strip_prefix("TENCENT_")
+            .unwrap_or(&self.sgp_server_id)
+            .to_ascii_uppercase();
+
+        let request_url = format!(
+            "{}/gsm/v1/ledge/spectator/region/{}/puuid/{}",
+            self.base_url, sub_id, puuid
+        );
+
+        let send = |token: &str| {
+            self.http
+                .get(&request_url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("User-Agent", USER_AGENT)
+                .send()
+        };
+
+        let mut response = send(&self.league_session_token).await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            // 观战接口可能只认 entitlements token，换 access_token 重试一次。
+            response = send(&self.access_token).await?;
+        }
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(PlayerActiveGame {
+                in_game: false,
+                game_id: None,
+                queue_config_id: None,
+                queue_type_name: None,
+                game_mode: None,
+                game_state: None,
+                teams: Vec::new(),
+            });
+        }
+
+        if !response.status().is_success() {
+            return Err(AppError::SgpUnavailable(format!(
+                "SGP 实时对局返回 {}",
+                response.status()
+            )));
+        }
+
+        let info = parse_sgp_json::<SgpActiveGame>(response, "SGP 实时对局").await?;
+        Ok(sgp_active_game_to_response(info))
+    }
+}
+
+pub async fn debug_official_api_probe(
+    lcu: &LcuClient,
+    auth: &ClientAuth,
+    sgp_server_id: Option<&str>,
+) -> AppResult<OfficialApiDebugResponse> {
+    let summoner = lcu.current_summoner().await?;
+    let sgp = SgpClient::new(lcu, auth, sgp_server_id).await?;
+    let sub_id = sgp
+        .sgp_server_id
+        .strip_prefix("TENCENT_")
+        .unwrap_or(&sgp.sgp_server_id)
+        .to_ascii_uppercase();
+
+    let ranked_request_url = format!(
+        "{}/leagues-ledge/v2/rankedStats/puuid/{}",
+        sgp.base_url, summoner.puuid
+    );
+    let ranked_payload = sgp
+        .http
+        .get(&ranked_request_url)
+        .header(
+            "Authorization",
+            format!("Bearer {}", sgp.league_session_token),
+        )
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .await?
+        .text()
+        .await
+        .map_err(AppError::Http)?;
+    let ranked_like_paths = collect_rank_like_paths_from_text(&ranked_payload);
+
+    let match_history_request_url = format!(
+        "{}/match-history-query/v1/products/lol/player/{}/SUMMARY?startIndex=0&count={}",
+        sgp.base_url, summoner.puuid, OFFICIAL_PROBE_SAMPLE_COUNT
+    );
+    let match_history_payload = sgp
+        .http
+        .get(format!(
+            "{}/match-history-query/v1/products/lol/player/{}/SUMMARY",
+            sgp.base_url, summoner.puuid
+        ))
+        .header("Authorization", format!("Bearer {}", sgp.access_token))
+        .header("User-Agent", USER_AGENT)
+        .query(&[
+            ("startIndex", "0".to_string()),
+            ("count", OFFICIAL_PROBE_SAMPLE_COUNT.to_string()),
+        ])
+        .send()
+        .await?
+        .text()
+        .await
+        .map_err(AppError::Http)?;
+    let match_history_like_paths = collect_rank_like_paths_from_text(&match_history_payload);
+
+    let games = sgp
+        .match_history(&summoner.puuid, 0, OFFICIAL_PROBE_SAMPLE_COUNT)
+        .await
+        .unwrap_or_default();
+    let owner_champion_by_game = games
+        .iter()
+        .map(|game| {
+            let champion_id = game
+                .participant_identities
+                .iter()
+                .find(|identity| identity.player.puuid.eq_ignore_ascii_case(&summoner.puuid))
+                .and_then(|identity| {
+                    game.participants
+                        .iter()
+                        .find(|participant| participant.participant_id == identity.participant_id)
+                        .map(|participant| participant.champion_id)
+                })
+                .unwrap_or_default();
+            (game.game_id, champion_id)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut sample_games = Vec::new();
+    for game in games.into_iter().take(OFFICIAL_PROBE_SAMPLE_COUNT) {
+        let summary_request_url = format!(
+            "{}/match-history-query/v1/products/lol/{}_{}/SUMMARY",
+            sgp.base_url, sub_id, game.game_id
+        );
+        let summary_payload = sgp
+            .http
+            .get(&summary_request_url)
+            .header("Authorization", format!("Bearer {}", sgp.access_token))
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await?
+            .text()
+            .await
+            .map_err(AppError::Http)?;
+
+        sample_games.push(OfficialApiProbeSample {
+            game_id: game.game_id,
+            queue_id: game.queue_id,
+            game_mode: game.game_mode,
+            game_creation: game.game_creation,
+            champion_id: owner_champion_by_game
+                .get(&game.game_id)
+                .copied()
+                .unwrap_or_default(),
+            summary_request_url,
+            rank_like_paths: collect_rank_like_paths_from_text(&summary_payload),
+            first_participant_challenge_hits: collect_first_participant_challenge_hits(&summary_payload),
+            summary_payload,
+        });
+    }
+
+    Ok(OfficialApiDebugResponse {
+        sgp_server_id: sgp.sgp_server_id,
+        base_url: sgp.base_url,
+        summoner,
+        ranked_request_url,
+        ranked_payload,
+        ranked_like_paths,
+        match_history_request_url,
+        match_history_payload,
+        match_history_like_paths,
+        sample_games,
+        note: "展示的是当前客户端可直接访问的官方接口原始返回，不做二次美化。字段命中会额外标出包含 elo/mmr/rating/rank/tier 等关键词的路径。".to_string(),
+    })
 }
 
 pub fn default_sgp_server_id(auth: &ClientAuth) -> String {
@@ -502,6 +682,71 @@ struct SgpParticipant {
     role: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SgpActiveGame {
+    #[serde(default)]
+    game: Option<SgpActiveGameDetail>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SgpActiveGameDetail {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    game_state: String,
+    #[serde(default)]
+    queue_type_name: String,
+    #[serde(default)]
+    game_mode: String,
+    #[serde(default)]
+    game_queue_config_id: i32,
+    #[serde(default)]
+    team_one: Vec<SgpActivePlayer>,
+    #[serde(default)]
+    team_two: Vec<SgpActivePlayer>,
+    #[serde(default)]
+    player_champion_selections: Vec<SgpActiveSelection>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SgpActivePlayer {
+    #[serde(default)]
+    puuid: String,
+    // SGP 观战接口返回的召唤师数字 ID；当前下游以 puuid 为主键，此字段仅随反序列化保留
+    // 以备后续需要 summonerId 映射时使用，故允许 dead_code。
+    #[serde(default)]
+    #[allow(dead_code)]
+    summoner_id: i64,
+    #[serde(default)]
+    profile_icon_id: u32,
+    #[serde(default)]
+    champion_id: u32,
+    #[serde(default)]
+    summoner_name: String,
+    #[serde(default)]
+    summoner_internal_name: String,
+    #[serde(default)]
+    selected_role: String,
+    #[serde(default)]
+    selected_position: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SgpActiveSelection {
+    #[serde(default)]
+    summoner_internal_name: String,
+    #[serde(default)]
+    summoner_name: String,
+    #[serde(default)]
+    spell1_id: u32,
+    #[serde(default)]
+    spell2_id: u32,
+}
+
 async fn parse_sgp_json<T>(response: reqwest::Response, context: &str) -> AppResult<T>
 where
     T: DeserializeOwned,
@@ -674,6 +919,83 @@ fn sgp_summoner_to_lcu(summoner: SgpSummoner) -> SummonerInfo {
     }
 }
 
+fn sgp_active_game_to_response(info: SgpActiveGame) -> PlayerActiveGame {
+    let Some(game) = info.game else {
+        return PlayerActiveGame {
+            in_game: false,
+            game_id: None,
+            queue_config_id: None,
+            queue_type_name: None,
+            game_mode: None,
+            game_state: None,
+            teams: Vec::new(),
+        };
+    };
+
+    // 技能只出现在 playerChampionSelections 里，按召唤师内部名配对到各队成员。
+    let spells = game
+        .player_champion_selections
+        .iter()
+        .map(|selection| {
+            (
+                active_player_key(&selection.summoner_internal_name, &selection.summoner_name),
+                selection.spell1_id,
+                selection.spell2_id,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let build_team = |players: Vec<SgpActivePlayer>, name: String| ActiveGameTeam {
+        name,
+        players: players
+            .into_iter()
+            .map(|player| {
+                let key =
+                    active_player_key(&player.summoner_internal_name, &player.summoner_name);
+                let (spell1_id, spell2_id) = spells
+                    .iter()
+                    .find(|(entry, _, _)| *entry == key)
+                    .map(|(_, spell1, spell2)| (*spell1, *spell2))
+                    .unwrap_or((0, 0));
+                ActiveGamePlayer {
+                    puuid: player.puuid,
+                    summoner_name: player.summoner_name,
+                    champion_id: player.champion_id,
+                    spell1_id,
+                    spell2_id,
+                    profile_icon_id: player.profile_icon_id,
+                    position: if player.selected_position.trim().is_empty() {
+                        player.selected_role
+                    } else {
+                        player.selected_position
+                    },
+                }
+            })
+            .collect(),
+    };
+
+    PlayerActiveGame {
+        in_game: true,
+        game_id: Some(game.id),
+        queue_config_id: Some(game.game_queue_config_id),
+        queue_type_name: Some(game.queue_type_name),
+        game_mode: Some(game.game_mode),
+        game_state: Some(game.game_state),
+        teams: vec![
+            build_team(game.team_one, "蓝方".to_string()),
+            build_team(game.team_two, "红方".to_string()),
+        ],
+    }
+}
+
+fn active_player_key(internal_name: &str, summoner_name: &str) -> String {
+    if internal_name.trim().is_empty() {
+        summoner_name.trim().to_string()
+    } else {
+        internal_name.trim().to_string()
+    }
+}
+
 fn sgp_ranked_stats_to_ranked_response(ranked: SgpRankedStats) -> RankedStatsResponse {
     let mut queue_map = RankedQueueMap::default();
 
@@ -781,6 +1103,88 @@ fn first_non_empty(values: &[&String]) -> String {
         .unwrap_or_default()
 }
 
+fn has_rank_like_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    [
+        "elo",
+        "mmr",
+        "rating",
+        "matchmaking",
+        "leaguepoints",
+        "tier",
+        "rank",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn collect_matching_paths(value: &Value, path: &str, matches: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let next_path = if path.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{path}.{key}")
+                };
+                if has_rank_like_key(key) {
+                    matches.push(next_path.clone());
+                }
+                collect_matching_paths(child, &next_path, matches);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let next_path = if path.is_empty() {
+                    format!("[{index}]")
+                } else {
+                    format!("{path}[{index}]")
+                };
+                collect_matching_paths(child, &next_path, matches);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_rank_like_paths_from_text(text: &str) -> Vec<String> {
+    let Ok(json) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+
+    let mut matches = Vec::new();
+    collect_matching_paths(&json, "", &mut matches);
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+fn collect_first_participant_challenge_hits(text: &str) -> Vec<String> {
+    let Ok(json) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+
+    let hits = json
+        .get("json")
+        .and_then(|value| value.get("participants"))
+        .and_then(Value::as_array)
+        .and_then(|participants| participants.first())
+        .and_then(|participant| participant.get("challenges"))
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter(|(key, _)| has_rank_like_key(key))
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut hits = hits;
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
 fn tencent_sgp_base_url(sgp_server_id: &str) -> AppResult<&'static str> {
     let Some(rso_platform_id) = sgp_server_id.strip_prefix("TENCENT_") else {
         return Err(AppError::SgpUnavailable(
@@ -818,4 +1222,125 @@ fn should_retry_status(status: StatusCode) -> bool {
 async fn wait_before_retry(attempt: usize) {
     let delay_ms = 500 * (attempt as u64 + 1);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::client_discovery::discover_primary_client;
+    use serde_json::Value;
+
+    fn has_rank_like_key(key: &str) -> bool {
+        let normalized = key.to_ascii_lowercase();
+        [
+            "elo",
+            "mmr",
+            "rating",
+            "matchmaking",
+            "leaguepoints",
+            "tier",
+            "rank",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+    }
+
+    fn collect_matching_paths(value: &Value, path: &str, matches: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let next_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if has_rank_like_key(key) {
+                        matches.push(next_path.clone());
+                    }
+                    collect_matching_paths(child, &next_path, matches);
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    collect_matching_paths(child, &format!("{path}[{index}]"), matches);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "手动触发：探测官方对局/段位接口里是否存在 ELO 或近似字段"]
+    async fn manual_probe_official_rank_like_fields() {
+        let auth = discover_primary_client().expect("应能找到已登录客户端");
+        let lcu = LcuClient::new(&auth).expect("应能创建 LCU 客户端");
+        let summoner = lcu.current_summoner().await.expect("应能读取当前召唤师");
+        let sgp = SgpClient::new(&lcu, &auth, None)
+            .await
+            .expect("应能创建 SGP 客户端");
+
+        println!(
+            "current summoner => '{}' puuid='{}' server='{}'",
+            summoner.display_name, summoner.puuid, sgp.sgp_server_id
+        );
+
+        let ranked = sgp
+            .ranked_stats(&summoner.puuid)
+            .await
+            .expect("应能读取官方 rankedStats");
+        println!("official rankedStats => {ranked:#?}");
+
+        let history = sgp
+            .match_history(&summoner.puuid, 0, 1)
+            .await
+            .expect("应能读取最近对局");
+        let game = history.first().expect("最近对局至少应有 1 局");
+        let sub_id = sgp
+            .sgp_server_id
+            .strip_prefix("TENCENT_")
+            .unwrap_or(&sgp.sgp_server_id)
+            .to_ascii_uppercase();
+
+        let summary_text = sgp
+            .http
+            .get(format!(
+                "{}/match-history-query/v1/products/lol/{}_{}/SUMMARY",
+                sgp.base_url, sub_id, game.game_id
+            ))
+            .header("Authorization", format!("Bearer {}", sgp.access_token))
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await
+            .expect("最近对局详情请求应成功")
+            .text()
+            .await
+            .expect("应能读取最近对局详情文本");
+
+        let summary_json: Value =
+            serde_json::from_str(&summary_text).expect("对局详情原始 JSON 应能解析");
+        let mut all_matches = Vec::new();
+        collect_matching_paths(&summary_json, "", &mut all_matches);
+
+        println!("raw summary rank-like keys => {:?}", all_matches);
+
+        let challenge_matches = summary_json
+            .get("json")
+            .and_then(|value| value.get("participants"))
+            .and_then(Value::as_array)
+            .and_then(|participants| participants.first())
+            .and_then(|participant| participant.get("challenges"))
+            .and_then(Value::as_object)
+            .map(|map| {
+                map.iter()
+                    .filter(|(key, _)| has_rank_like_key(key))
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        println!(
+            "first participant challenge rank-like keys => {:?}",
+            challenge_matches
+        );
+    }
 }

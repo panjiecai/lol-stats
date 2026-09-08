@@ -8,8 +8,12 @@ import type {
   GameAssetBundle,
   LiveGameResponse,
   MatchDetailResponse,
+  PlayerActiveGame,
+  ExternalEloLookupDebugResponse,
+  OfficialApiDebugResponse,
   PlayerEloEstimateResponse,
   PlayerEloEstimateTaskStatus,
+  PlayerEloQueueSnapshot,
   PlayerStatsResponse,
   RankedStatsResponse,
   SummonerSearchCandidate,
@@ -195,6 +199,10 @@ export function getPlayerEloEstimateTask(jobId: string) {
   })
 }
 
+export function getPlayerEloQueue() {
+  return invoke<PlayerEloQueueSnapshot>("get_player_elo_queue")
+}
+
 export function clearPlayerEloCache(
   puuid: string,
   gameName: string,
@@ -211,6 +219,21 @@ export function clearPlayerEloCache(
   })
 }
 
+export function debugExternalPlayerEloLookup(riotId: string, sgpServerId: string) {
+  return invoke<ExternalEloLookupDebugResponse>("debug_external_player_elo_lookup", {
+    riotId,
+    sgpServerId,
+  })
+}
+
+export function debugOfficialApi() {
+  return invoke<OfficialApiDebugResponse>("debug_official_api")
+}
+
 export function loadLiveGame(depth: number) {
   return invoke<LiveGameResponse>("load_live_game", { depth })
+}
+
+export function queryPlayerActiveGame(puuid: string, sgpServerId?: string) {
+  return invoke<PlayerActiveGame>("query_player_active_game", { puuid, sgpServerId })
 }

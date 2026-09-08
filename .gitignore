@@ -27,3 +27,6 @@ gen/schemas
 *.njsproj
 *.sln
 *.sw?
+
+# local diagnostic scratch
+inspect_queues.py

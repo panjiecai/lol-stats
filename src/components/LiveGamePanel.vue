@@ -119,6 +119,8 @@ function queueName(liveGame: LiveGameResponse) {
     1711: "斗魂竞技场",
     1712: "斗魂竞技场",
     2400: "海克斯大乱斗",
+    2410: "海斗大赛",
+    2450: "海克斯大乱斗",
   }
 
   if (liveGame.queueId && map[liveGame.queueId]) return map[liveGame.queueId]

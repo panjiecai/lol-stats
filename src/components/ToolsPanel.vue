@@ -10,9 +10,10 @@ import { championName } from "../utils"
 import ChampionAvatar from "./ChampionAvatar.vue"
 import FriendsTool from "./FriendsTool.vue"
 import HextechAugmentDesigner from "./HextechAugmentDesigner.vue"
+import OfficialApiProbePanel from "./OfficialApiProbePanel.vue"
 import ReservedTools from "./ReservedTools.vue"
 
-type ToolTab = "liveChampion" | "aramkit" | "hextech" | "friends" | "tier" | "reserved"
+type ToolTab = "liveChampion" | "aramkit" | "officialApi" | "hextech" | "friends" | "tier" | "reserved"
 type TierId = "hang" | "top" | "elite" | "npc" | "bad"
 
 type TierState = Record<TierId, number[]>
@@ -479,11 +480,11 @@ async function exportRankingImage() {
           <ChampionAvatar :champion-id="liveChampion.id" :champions="champions" :size="20" />
           {{ championName(champions, liveChampion.id) }}
         </button>
+        <button :class="{ active: activeTab === 'officialApi' }" @click="activateTab('officialApi')">官方接口</button>
         <button :class="{ active: activeTab === 'aramkit' }" @click="activateTab('aramkit')">AramKit</button>
         <button :class="{ active: activeTab === 'hextech' }" @click="activateTab('hextech')">海克斯设计</button>
         <button :class="{ active: activeTab === 'friends' }" @click="activateTab('friends')">好友</button>
         <button :class="{ active: activeTab === 'tier' }" @click="activateTab('tier')">由夯到拉</button>
-        <button :class="{ active: activeTab === 'reserved' }" @click="activateTab('reserved')">快捷工具</button>
       </div>
 
       <label class="ranking-switch" v-show="activeTab === 'tier'">
@@ -540,6 +541,8 @@ async function exportRankingImage() {
         referrerpolicy="no-referrer-when-downgrade"
       ></iframe>
     </section>
+
+    <OfficialApiProbePanel v-show="activeTab === 'officialApi'" :active="activeTab === 'officialApi'" />
 
     <HextechAugmentDesigner v-show="activeTab === 'hextech'" />
 

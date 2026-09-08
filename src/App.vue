@@ -23,6 +23,7 @@ import {
   cancelStatsLoad,
   checkAppUpdate,
   connectionStatus,
+  getPlayerEloQueue,
   loadCurrentRankedStats,
   loadGameflowPhase,
   loadRankedStats,
@@ -35,16 +36,33 @@ import {
   searchPlayer,
   searchPlayerWithProgress,
   searchSummonerCandidates,
+  startPlayerEloEstimateTask,
 } from "./api"
+import ActiveGamePanel from "./components/ActiveGamePanel.vue"
 import LiveGamePanel from "./components/LiveGamePanel.vue"
 import MatchOverviewPanel from "./components/MatchOverviewPanel.vue"
 import PlayerRecordTab from "./components/PlayerRecordTab.vue"
 import RecordView from "./components/RecordView.vue"
+import RecordWatchToolbar from "./components/RecordWatchToolbar.vue"
 import ToastStack from "./components/ToastStack.vue"
 import ToolsPanel from "./components/ToolsPanel.vue"
 import { notifyKey, type AppToast, type ToastPayload } from "./notifications"
+import {
+  ALL_SEARCH_SERVER_ID,
+  DEFAULT_SEARCH_SERVER_ID,
+  isKnownSearchServer,
+  normalizeSearchServerId,
+  searchServerLabel,
+  searchServerOptions,
+} from "./servers"
 import { AUTO_ACCEPT_ENABLED_KEY, readBooleanSetting } from "./toolSettings"
 import { championName, riotId } from "./utils"
+import {
+  DEFAULT_STATS_DEPTH,
+  MAX_RECENT_DEPTH,
+  MAX_STATS_DEPTH,
+  MIN_STATS_DEPTH,
+} from "./statsDepth"
 import type {
   AppUpdateInfo,
   ChampionSummaryItem,
@@ -55,6 +73,7 @@ import type {
   MatchDetailPlayer,
   MatchDetailResponse,
   OpenMatchPayload,
+  PlayerEloQueueItem,
   PlayerStatsResponse,
   RankedStatsResponse,
   RecentGame,
@@ -63,8 +82,7 @@ import type {
   SummonerSearchCandidate,
 } from "./types"
 
-type PageKey = "current" | "live" | "search" | "details" | "tools"
-type SearchServerOption = { id: string; label: string }
+type PageKey = "current" | "live" | "search" | "details" | "tools" | "eloQueue"
 type SearchHistoryItem = { query: string; sgpServerId: string }
 type OverviewDrillTab = {
   id: string
@@ -72,6 +90,7 @@ type OverviewDrillTab = {
   type: "overview"
   title: string
   ownerLabel: string
+  ownerPuuid?: string
   game: RecentGame
   sgpServerId?: string
   detail: MatchDetailResponse | null
@@ -94,6 +113,7 @@ type DrillHistoryPayload =
       type: "overview"
       title: string
       ownerLabel: string
+      ownerPuuid?: string
       game: RecentGame
       sgpServerId?: string
     }
@@ -136,15 +156,10 @@ const DEFAULT_WINDOW_SIZE: WindowStartupSize = { width: 1363, height: 836 }
 const MIN_WINDOW_SIZE: WindowStartupSize = { width: 1040, height: 680 }
 const DEFAULT_LIVE_CARD_EXTRA_HEIGHT = 0
 const MAX_LIVE_CARD_EXTRA_HEIGHT = 480
-const ALL_SEARCH_SERVER_ID = "ALL"
-const DEFAULT_SEARCH_SERVER_ID = "TENCENT_HN1"
 const RECENT_PAGE_SIZE = 20
-const MAX_RECENT_DEPTH = 1000
-const DEFAULT_STATS_DEPTH = 500
-const MIN_STATS_DEPTH = 50
-const MAX_STATS_DEPTH = 1000
 const LIVE_STATS_DEPTH = 50
 const LIVE_AUTO_REFRESH_MS = 15000
+const PLAYER_ELO_QUEUE_REFRESH_MS = 5000
 const GAMEFLOW_WATCH_MS = 1000
 const AUTO_LIVE_PHASES = new Set(["GameStart", "InProgress", "Reconnect"])
 const LIVE_DATA_PHASES = new Set([
@@ -198,20 +213,6 @@ const emptyGameAssets = (): GameAssetBundle => ({
   augments: [],
 })
 
-const searchServerOptions: SearchServerOption[] = [
-  { id: ALL_SEARCH_SERVER_ID, label: "不限" },
-  { id: "TENCENT_HN1", label: "艾欧尼亚" },
-  { id: "TENCENT_HN10", label: "黑色玫瑰" },
-  { id: "TENCENT_NJ100", label: "联盟一区" },
-  { id: "TENCENT_GZ100", label: "联盟二区" },
-  { id: "TENCENT_CQ100", label: "联盟三区" },
-  { id: "TENCENT_TJ100", label: "联盟四区" },
-  { id: "TENCENT_TJ101", label: "联盟五区" },
-  { id: "TENCENT_BGP2", label: "峡谷之巅" },
-  { id: "TENCENT_PBE", label: "体验服" },
-  { id: "TENCENT_PREPBE", label: "PREPBE" },
-]
-
 const status = ref<ConnectionStatus | null>(null)
 const champions = ref<ChampionSummaryItem[]>([])
 const gameAssets = ref<GameAssetBundle>(emptyGameAssets())
@@ -261,6 +262,16 @@ const liveGame = ref<LiveGameResponse | null>(null)
 const liveLoading = ref(false)
 const liveRefreshing = ref(false)
 const liveError = ref("")
+const queueCreateInput = ref("")
+const queueCreateServerId = ref(DEFAULT_SEARCH_SERVER_ID)
+const queueCreateCandidates = ref<SummonerSearchCandidate[]>([])
+const queueCreateLoading = ref(false)
+const queueCreateError = ref("")
+const queueCreateMessage = ref("")
+const playerEloQueue = ref<PlayerEloQueueItem[]>([])
+const playerEloQueueHistory = ref<PlayerEloQueueItem[]>([])
+const playerEloQueueLoading = ref(false)
+const playerEloQueueError = ref("")
 const drillTabs = ref<DrillTab[]>([])
 const activeDrillTabId = ref("")
 const toasts = ref<AppToast[]>([])
@@ -276,6 +287,8 @@ const progressOverlay = ref({
 
 let unlistenProgress: UnlistenFn | null = null
 let liveRefreshTimer: number | null = null
+let playerEloQueueTimer: number | null = null
+let queueCreateRequestKey = ""
 let liveGameRenderSignature = ""
 let gameflowWatchTimer: number | null = null
 let autoLiveSessionActive = false
@@ -297,6 +310,7 @@ const pageScrollTop: Record<PageKey, number> = {
   search: 0,
   details: 0,
   tools: 0,
+  eloQueue: 0,
 }
 
 const championMap = computed(() => {
@@ -320,6 +334,7 @@ const activeDrillTab = computed(
 )
 const canGoBack = computed(() => navigationHistoryIndex.value > 0)
 const canGoForward = computed(() => navigationHistoryIndex.value < navigationHistory.value.length - 1)
+const playerEloQueueWaitingCount = computed(() => playerEloQueue.value.length)
 const liveAramkitChampionId = computed(() => {
   const game = liveGame.value
   if (!game) return null
@@ -340,12 +355,21 @@ const liveAramkitChampionId = computed(() => {
   return championId > 0 && championMap.value[championId] ? championId : null
 })
 
+const currentPuuid = computed(
+  () => status.value?.summoner?.puuid || currentRecentStats.value?.summoner?.puuid || "",
+)
+const searchPuuid = computed(
+  () =>
+    searchRecentStats.value?.summoner?.puuid || searchFullStats.value?.summoner?.puuid || "",
+)
+
 const navItems: Array<{ key: PageKey; label: string; icon: typeof UserRound }> = [
   { key: "current", label: "当前角色", icon: UserRound },
   { key: "live", label: "实时战绩", icon: Swords },
   { key: "search", label: "查战绩", icon: Search },
   { key: "details", label: "详细战绩", icon: FileText },
   { key: "tools", label: "工具", icon: Wrench },
+  { key: "eloQueue", label: "运算队列", icon: LoaderCircle },
 ]
 
 function errorMessage(error: unknown) {
@@ -767,6 +791,7 @@ function overviewHistoryPayload(payload: OpenMatchPayload): Extract<DrillHistory
     type: "overview",
     title: `${payload.ownerLabel} ${championName(championMap.value, payload.game.championId)}`,
     ownerLabel: payload.ownerLabel,
+    ownerPuuid: payload.ownerPuuid,
     game: copyRecentGame(payload.game),
     sgpServerId: payload.sgpServerId,
   }
@@ -802,6 +827,7 @@ function drillTabToHistoryPayload(tab: DrillTab): DrillHistoryPayload {
       type: "overview",
       title: tab.title,
       ownerLabel: tab.ownerLabel,
+      ownerPuuid: tab.ownerPuuid,
       game: copyRecentGame(tab.game),
       sgpServerId: tab.sgpServerId,
     }
@@ -967,6 +993,7 @@ function createOverviewTab(payload: Extract<DrillHistoryPayload, { type: "overvi
     type: "overview",
     title: payload.title,
     ownerLabel: payload.ownerLabel,
+    ownerPuuid: payload.ownerPuuid,
     game: copyRecentGame(payload.game),
     sgpServerId: payload.sgpServerId,
     detail: null,
@@ -1146,17 +1173,163 @@ function navigateForward() {
   applyNavigationSnapshot(target)
 }
 
-function isKnownSearchServer(sgpServerId: string) {
-  return searchServerOptions.some((option) => option.id === sgpServerId)
+function playerEloQueueStatusLabel(item: PlayerEloQueueItem) {
+  if (item.status === "completed") return "已完成"
+  if (item.status === "failed") return "已失败"
+  if (item.status === "retrying") return "等待重试"
+  if (item.status === "running") return "计算中"
+  if (item.status === "pending") return "排队中"
+  return item.status
 }
 
-function normalizeSearchServerId(sgpServerId?: string) {
-  const normalized = sgpServerId?.trim().toUpperCase() || DEFAULT_SEARCH_SERVER_ID
-  return isKnownSearchServer(normalized) ? normalized : DEFAULT_SEARCH_SERVER_ID
+function playerEloQueueItemTitle(item: PlayerEloQueueItem) {
+  return item.displayName || item.riotId || "未命名玩家"
 }
 
-function searchServerLabel(sgpServerId: string) {
-  return searchServerOptions.find((option) => option.id === sgpServerId)?.label || sgpServerId
+function playerEloQueueUpdatedText(updatedAtMs: number) {
+  const deltaMs = Math.max(0, Date.now() - updatedAtMs)
+  const seconds = Math.max(1, Math.floor(deltaMs / 1000))
+  if (seconds < 60) return `${seconds} 秒前更新`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} 分钟前更新`
+  const hours = Math.floor(minutes / 60)
+  return `${hours} 小时前更新`
+}
+
+function normalizeQueueCreateServerId(sgpServerId?: string) {
+  const normalized = normalizeSearchServerId(sgpServerId)
+  return normalized === ALL_SEARCH_SERVER_ID ? DEFAULT_SEARCH_SERVER_ID : normalized
+}
+
+function queueCreateCandidateMatchesQuery(candidate: SummonerSearchCandidate, query: string) {
+  const normalizedQuery = normalizeSearchInputText(query).toLowerCase()
+  if (!normalizedQuery) return false
+
+  const riotId = candidateRiotId(candidate).toLowerCase()
+  const displayName = candidate.gameName.trim().toLowerCase()
+  return riotId === normalizedQuery || displayName === normalizedQuery
+}
+
+async function enqueuePlayerEloCandidate(candidate: SummonerSearchCandidate) {
+  queueCreateLoading.value = true
+  queueCreateError.value = ""
+
+  try {
+    const displayName = candidateRiotId(candidate)
+    const task = await startPlayerEloEstimateTask(
+      candidate.puuid,
+      candidate.gameName,
+      candidate.tagLine,
+      displayName,
+      candidate.sgpServerId,
+      false,
+    )
+
+    queueCreateInput.value = displayName
+    queueCreateServerId.value = normalizeQueueCreateServerId(candidate.sgpServerId)
+    queueCreateCandidates.value = []
+    queueCreateMessage.value =
+      task.status === "completed"
+        ? `已为 ${displayName} 直接返回缓存结果`
+        : `已将 ${displayName} 加入角色 ELO 运算队列`
+
+    showToast({
+      kind: "success",
+      title: "角色 ELO 任务已提交",
+      message:
+        task.status === "completed"
+          ? `${displayName} 已命中缓存`
+          : `${displayName} 已进入后台运算`,
+      duration: 5000,
+    })
+    await loadPlayerEloQueue({ silent: true })
+  } catch (error) {
+    queueCreateError.value = errorMessage(error)
+    notifyError("加入角色 ELO 运算失败", error)
+  } finally {
+    queueCreateLoading.value = false
+  }
+}
+
+async function submitQueueCreateForm(
+  query = queueCreateInput.value,
+  sgpServerId = queueCreateServerId.value,
+) {
+  const text = normalizeSearchInputText(query)
+  if (!text || queueCreateLoading.value) return
+
+  const normalizedServerId = normalizeQueueCreateServerId(sgpServerId)
+  queueCreateInput.value = text
+  queueCreateServerId.value = normalizedServerId
+  queueCreateLoading.value = true
+  queueCreateError.value = ""
+  queueCreateMessage.value = ""
+  queueCreateCandidates.value = []
+
+  const requestKey = `${normalizedServerId}:${text}:${Date.now()}`
+  queueCreateRequestKey = requestKey
+
+  try {
+    await ensureClientReady()
+    const candidates = await searchSummonerCandidates(text, normalizedServerId)
+    if (queueCreateRequestKey !== requestKey) return
+
+    if (!candidates.length) {
+      queueCreateError.value = "没有找到这个名字在当前区服的召唤师"
+      return
+    }
+
+    const exactCandidate =
+      candidates.find((candidate) => queueCreateCandidateMatchesQuery(candidate, text)) ??
+      (candidates.length === 1 ? candidates[0] : null)
+
+    if (exactCandidate) {
+      await enqueuePlayerEloCandidate(exactCandidate)
+      return
+    }
+
+    queueCreateCandidates.value = candidates
+    queueCreateMessage.value = `找到 ${candidates.length} 个候选，请点击要加入运算队列的玩家`
+  } catch (error) {
+    if (queueCreateRequestKey !== requestKey) return
+    queueCreateError.value = errorMessage(error)
+    notifyError("候选召唤师读取失败", error)
+  } finally {
+    if (queueCreateRequestKey === requestKey) {
+      queueCreateLoading.value = false
+    }
+  }
+}
+
+async function loadPlayerEloQueue(options: { silent?: boolean } = {}) {
+  const silent = Boolean(options.silent)
+  if (playerEloQueueLoading.value && silent) return
+  if (!silent) playerEloQueueLoading.value = true
+  playerEloQueueError.value = ""
+
+  try {
+    const snapshot = await getPlayerEloQueue()
+    playerEloQueue.value = snapshot.activeItems
+    playerEloQueueHistory.value = snapshot.historyItems
+  } catch (error) {
+    playerEloQueueError.value = errorMessage(error)
+  } finally {
+    playerEloQueueLoading.value = false
+  }
+}
+
+function startPlayerEloQueueRefresh() {
+  if (playerEloQueueTimer !== null) return
+  void loadPlayerEloQueue()
+  playerEloQueueTimer = window.setInterval(() => {
+    if (activePage.value === "eloQueue") void loadPlayerEloQueue({ silent: true })
+  }, PLAYER_ELO_QUEUE_REFRESH_MS)
+}
+
+function stopPlayerEloQueueRefresh() {
+  if (playerEloQueueTimer === null) return
+  window.clearInterval(playerEloQueueTimer)
+  playerEloQueueTimer = null
 }
 
 function currentClientSearchServerId() {
@@ -1745,7 +1918,7 @@ async function checkGameflowForAutoLive() {
   if (autoLiveSessionActive) return
   autoLiveSessionActive = true
 
-  navigateToPage("live")
+  // 开局后只静默拉取实时数据，不打断用户当前所在页面。
   void refreshLiveGame({ silent: true, switchPage: false })
 }
 
@@ -1794,6 +1967,12 @@ watch(activePage, (page, previousPage) => {
   } else {
     stopLiveAutoRefresh()
   }
+
+  if (page === "eloQueue") {
+    startPlayerEloQueueRefresh()
+  } else {
+    stopPlayerEloQueueRefresh()
+  }
 })
 
 onMounted(async () => {
@@ -1814,6 +1993,7 @@ onUnmounted(() => {
   unlistenProgress?.()
   stopGameflowWatcher()
   stopLiveAutoRefresh()
+  stopPlayerEloQueueRefresh()
   if (drillCachePruneTimer !== null) {
     window.clearInterval(drillCachePruneTimer)
     drillCachePruneTimer = null
@@ -1840,7 +2020,10 @@ onUnmounted(() => {
           @click="navigateToPage(item.key)"
         >
           <component :is="item.icon" :size="18" />
-          {{ item.label }}
+          <span>{{ item.label }}</span>
+          <span v-if="item.key === 'eloQueue' && playerEloQueueWaitingCount" class="nav-badge">
+            {{ playerEloQueueWaitingCount }}
+          </span>
         </button>
       </nav>
       <div class="sidebar-footer">
@@ -1882,6 +2065,8 @@ onUnmounted(() => {
             :champions="championMap"
             :game-assets="gameAssets"
             :sgp-server-id="activeDrillTab.sgpServerId"
+            :owner-label="activeDrillTab.ownerLabel"
+            :owner-puuid="activeDrillTab.ownerPuuid"
             @open-player="openPlayerDrillTab($event, activeDrillTab.sgpServerId)"
           />
 
@@ -1898,28 +2083,40 @@ onUnmounted(() => {
         </KeepAlive>
       </section>
 
-      <RecordView
-        v-show="activePage === 'current'"
-        :recent-stats="currentRecentStats"
-        :full-stats="currentFullStats"
-        :ranked-stats="currentRankedStats"
-        :ranked-loading="currentRankedLoading"
-        :share-settings="shareSettings"
-        :champions="championMap"
-        :game-assets="gameAssets"
-        :loading="currentRecentLoading || currentStatsLoading"
-        :recent-loading="currentRecentLoading"
-        :recent-has-more="currentRecentHasMore"
-        :stats-depth="currentStatsDepth"
-        :error="currentError"
-        @load-recent="loadCurrentRecent"
-        @load-stats="loadCurrentStats"
-        @refresh-recent="loadCurrentRecent(true)"
-        @refresh-stats="loadCurrentStats(true)"
-        @load-recent-more="loadCurrentRecentMore"
-        @change-stats-depth="changeCurrentStatsDepth"
-        @open-match="openOverviewTab"
-      />
+      <section class="current-page" v-show="activePage === 'current'">
+        <ActiveGamePanel
+          v-if="currentPuuid"
+          :puuid="currentPuuid"
+          :champions="championMap"
+          :game-assets="gameAssets"
+        />
+        <RecordView
+          :recent-stats="currentRecentStats"
+          :full-stats="currentFullStats"
+          :ranked-stats="currentRankedStats"
+          :ranked-loading="currentRankedLoading"
+          :share-settings="shareSettings"
+          :champions="championMap"
+          :game-assets="gameAssets"
+          :loading="currentRecentLoading || currentStatsLoading"
+          :recent-loading="currentRecentLoading"
+          :recent-has-more="currentRecentHasMore"
+          :stats-depth="currentStatsDepth"
+          :error="currentError"
+          is-self
+          @load-recent="loadCurrentRecent"
+          @load-stats="loadCurrentStats"
+          @refresh-recent="loadCurrentRecent(true)"
+          @refresh-stats="loadCurrentStats(true)"
+          @load-recent-more="loadCurrentRecentMore"
+          @change-stats-depth="changeCurrentStatsDepth"
+          @open-match="openOverviewTab"
+        >
+          <template #toolbar>
+            <RecordWatchToolbar :champions="championMap" :game-assets="gameAssets" is-self />
+          </template>
+        </RecordView>
+      </section>
 
       <section class="live-page" v-show="activePage === 'live'">
         <header class="page-header">
@@ -1943,6 +2140,155 @@ onUnmounted(() => {
           :card-extra-height="liveCardExtraHeight"
           @open-player="openLivePlayerDrillTab"
         />
+      </section>
+
+      <section class="queue-page" v-show="activePage === 'eloQueue'">
+        <header class="page-header">
+          <div>
+            <div class="eyebrow">Player ELO Queue</div>
+            <h2>等待运算列表</h2>
+          </div>
+          <button class="primary-action" @click="loadPlayerEloQueue()" :disabled="playerEloQueueLoading">
+            <LoaderCircle v-if="playerEloQueueLoading" class="spin" :size="16" />
+            <RefreshCw v-else :size="16" />
+            {{ playerEloQueueLoading ? "刷新中" : "刷新" }}
+          </button>
+        </header>
+
+        <section class="queue-create-panel">
+          <div class="queue-create-head">
+            <strong>发起角色 ELO 运算</strong>
+            <span>直接填写用户名或 Riot ID，并选择区服后加入后台运算队列</span>
+          </div>
+
+          <form class="search-box queue-create-box" @submit.prevent="submitQueueCreateForm()">
+            <select v-model="queueCreateServerId" class="server-select" :disabled="queueCreateLoading">
+              <option
+                v-for="option in searchServerOptions.filter((option) => option.id !== ALL_SEARCH_SERVER_ID)"
+                :key="option.id"
+                :value="option.id"
+              >
+                {{ option.label }}
+              </option>
+            </select>
+
+            <input
+              v-model.trim="queueCreateInput"
+              type="text"
+              maxlength="64"
+              placeholder="输入用户名或 Riot ID，例如 离于爱者无忧无怖#53258"
+              :disabled="queueCreateLoading"
+            />
+
+            <button type="submit" :disabled="queueCreateLoading || !queueCreateInput.trim()">
+              <LoaderCircle v-if="queueCreateLoading" class="spin" :size="16" />
+              <span>{{ queueCreateLoading ? "查询中" : "加入运算" }}</span>
+            </button>
+          </form>
+
+          <div class="queue-create-state success" v-if="queueCreateMessage">
+            <span>{{ queueCreateMessage }}</span>
+          </div>
+          <div class="queue-create-state error" v-if="queueCreateError">
+            <span>{{ queueCreateError }}</span>
+          </div>
+
+          <section class="candidate-panel queue-candidate-panel" v-if="queueCreateCandidates.length">
+            <div class="candidate-title">
+              <strong>选择要加入运算队列的玩家</strong>
+              <span>{{ queueCreateCandidates.length }} 个候选</span>
+            </div>
+
+            <div class="candidate-list">
+              <button
+                v-for="candidate in queueCreateCandidates"
+                :key="`queue-${candidate.sgpServerId}:${candidate.puuid}`"
+                type="button"
+                class="candidate-item queue-candidate-item"
+                :disabled="queueCreateLoading"
+                @click="enqueuePlayerEloCandidate(candidate)"
+              >
+                <div>
+                  <strong>{{ candidate.gameName }}</strong>
+                  <span>#{{ candidate.tagLine }}</span>
+                </div>
+                <em>{{ searchServerLabel(candidate.sgpServerId) }} · Lv.{{ candidate.summonerLevel || "-" }}</em>
+              </button>
+            </div>
+          </section>
+        </section>
+
+        <section class="queue-summary">
+          <strong>当前共有 {{ playerEloQueueWaitingCount }} 个角色在等待后台运算</strong>
+          <span>等待区只显示仍在排队、计算中或等待下一次自动重试的角色 ELO 任务</span>
+        </section>
+
+        <section class="queue-empty" v-if="!playerEloQueueLoading && !playerEloQueueError && !playerEloQueue.length">
+          <strong>当前没有等待中的角色</strong>
+          <span>如果外部站点短时返回空数据，任务会自动进入这里并每分钟继续重试</span>
+        </section>
+
+        <section class="queue-empty error" v-else-if="playerEloQueueError">
+          <strong>队列读取失败</strong>
+          <span>{{ playerEloQueueError }}</span>
+        </section>
+
+        <section class="queue-list" v-else>
+          <article v-for="item in playerEloQueue" :key="item.jobId" class="queue-card">
+            <header class="queue-card-head">
+              <div class="queue-card-title">
+                <strong>{{ playerEloQueueItemTitle(item) }}</strong>
+                <span v-if="item.riotId && item.riotId !== playerEloQueueItemTitle(item)">{{ item.riotId }}</span>
+              </div>
+              <span class="queue-status" :class="item.status">{{ playerEloQueueStatusLabel(item) }}</span>
+            </header>
+
+            <div class="queue-card-meta">
+              <span>{{ searchServerLabel(item.sgpServerId) }}</span>
+              <span>{{ playerEloQueueUpdatedText(item.updatedAtMs) }}</span>
+              <span v-if="item.currentElo !== null">当前 ELO {{ item.currentElo.toFixed(1) }}</span>
+              <span v-if="item.sampleGames > 0">样本 {{ item.sampleGames }} 局</span>
+              <span v-if="item.status === 'retrying' && item.nextPollDelayMs > 0">
+                {{ Math.max(1, Math.round(item.nextPollDelayMs / 1000)) }} 秒后再试
+              </span>
+            </div>
+
+            <p class="queue-card-message">{{ item.message }}</p>
+          </article>
+        </section>
+
+        <section class="queue-history-section">
+          <header class="queue-history-head">
+            <strong>最近历史</strong>
+            <span>保留最近完成或失败的角色 ELO 任务，便于回看后台是否补算成功</span>
+          </header>
+
+          <section class="queue-empty" v-if="!playerEloQueueLoading && !playerEloQueueHistory.length">
+            <strong>最近没有历史记录</strong>
+            <span>后续一旦后台重试成功或彻底失败，会自动出现在这里</span>
+          </section>
+
+          <section v-else class="queue-list queue-history-list">
+            <article v-for="item in playerEloQueueHistory" :key="`history-${item.jobId}`" class="queue-card queue-card-history">
+              <header class="queue-card-head">
+                <div class="queue-card-title">
+                  <strong>{{ playerEloQueueItemTitle(item) }}</strong>
+                  <span v-if="item.riotId && item.riotId !== playerEloQueueItemTitle(item)">{{ item.riotId }}</span>
+                </div>
+                <span class="queue-status" :class="item.status">{{ playerEloQueueStatusLabel(item) }}</span>
+              </header>
+
+              <div class="queue-card-meta">
+                <span>{{ searchServerLabel(item.sgpServerId) }}</span>
+                <span>{{ playerEloQueueUpdatedText(item.updatedAtMs) }}</span>
+                <span v-if="item.currentElo !== null">最终 ELO {{ item.currentElo.toFixed(1) }}</span>
+                <span v-if="item.sampleGames > 0">样本 {{ item.sampleGames }} 局</span>
+              </div>
+
+              <p class="queue-card-message">{{ item.message }}</p>
+            </article>
+          </section>
+        </section>
       </section>
 
       <section class="tools-page" v-show="activePage === 'tools'">
@@ -2027,56 +2373,70 @@ onUnmounted(() => {
           </div>
         </section>
 
-        <RecordView
-          v-else
-          :recent-stats="searchRecentStats"
-          :full-stats="searchFullStats"
-          :ranked-stats="searchRankedStats"
-          :ranked-loading="searchRankedLoading"
-          :champions="championMap"
-          :game-assets="gameAssets"
-          :loading="searchRecentLoading || searchStatsLoading"
-          :recent-loading="searchRecentLoading"
-          :recent-has-more="searchRecentHasMore"
-          :stats-depth="searchStatsDepth"
-          :error="searchError"
-          :sgp-server-id="activeSearchServerId"
-          :share-settings="shareSettings"
-          @load-recent="loadSearchRecent"
-          @load-stats="loadSearchStats"
-          @refresh-recent="loadSearchRecent(true)"
-          @refresh-stats="loadSearchStats(true)"
-          @load-recent-more="loadSearchRecentMore"
-          @change-stats-depth="changeSearchStatsDepth"
-          @open-match="openOverviewTab"
-        >
-          <template #toolbar>
-            <div class="search-toolbar">
-              <button class="return-search" @click="returnToSearchHome">
-                <ArrowLeft :size="16" />
-                返回
-              </button>
-              <div class="search-box compact">
-                <select
-                  v-model="selectedSearchServerId"
-                  class="server-select"
-                  aria-label="区服"
-                  @change="markSearchServerTouched"
-                >
-                  <option v-for="server in searchServerOptions" :key="server.id" :value="server.id">
-                    {{ server.label }}
-                  </option>
-                </select>
-                <Search :size="16" />
-                <input v-model="searchInput" placeholder="GameName#Tag 或 PUUID" @keyup.enter="runSearch()" />
-                <button @click="runSearch()" :disabled="!searchInput.trim() || searchCandidateLoading">
-                  <LoaderCircle v-if="searchCandidateLoading" class="spin" :size="14" />
-                  <span v-else>搜索</span>
+        <section class="search-result" v-else>
+          <ActiveGamePanel
+            v-if="searchPuuid"
+            :puuid="searchPuuid"
+            :sgp-server-id="activeSearchServerId"
+            :champions="championMap"
+            :game-assets="gameAssets"
+          />
+          <RecordView
+            :recent-stats="searchRecentStats"
+            :full-stats="searchFullStats"
+            :ranked-stats="searchRankedStats"
+            :ranked-loading="searchRankedLoading"
+            :champions="championMap"
+            :game-assets="gameAssets"
+            :loading="searchRecentLoading || searchStatsLoading"
+            :recent-loading="searchRecentLoading"
+            :recent-has-more="searchRecentHasMore"
+            :stats-depth="searchStatsDepth"
+            :error="searchError"
+            :sgp-server-id="activeSearchServerId"
+            :share-settings="shareSettings"
+            @load-recent="loadSearchRecent"
+            @load-stats="loadSearchStats"
+            @refresh-recent="loadSearchRecent(true)"
+            @refresh-stats="loadSearchStats(true)"
+            @load-recent-more="loadSearchRecentMore"
+            @change-stats-depth="changeSearchStatsDepth"
+            @open-match="openOverviewTab"
+          >
+            <template #toolbar>
+              <div class="search-toolbar">
+                <RecordWatchToolbar
+                  :account-query="activeSearchQuery"
+                  :sgp-server-id="activeSearchServerId"
+                  :champions="championMap"
+                  :game-assets="gameAssets"
+                />
+                <button class="return-search" @click="returnToSearchHome">
+                  <ArrowLeft :size="16" />
+                  返回
                 </button>
+                <div class="search-box compact">
+                  <select
+                    v-model="selectedSearchServerId"
+                    class="server-select"
+                    aria-label="区服"
+                    @change="markSearchServerTouched"
+                  >
+                    <option v-for="server in searchServerOptions" :key="server.id" :value="server.id">
+                      {{ server.label }}
+                    </option>
+                  </select>
+                  <Search :size="16" />
+                  <input v-model="searchInput" placeholder="GameName#Tag 或 PUUID" @keyup.enter="runSearch()" />
+                  <button @click="runSearch()" :disabled="!searchInput.trim() || searchCandidateLoading">
+                    <LoaderCircle v-if="searchCandidateLoading" class="spin" :size="14" />
+                    <span v-else>搜索</span>
+                  </button>
+                </div>
               </div>
-            </div>
-          </template>
-        </RecordView>
+            </template>
+          </RecordView>
+        </section>
       </section>
     </section>
 
@@ -2348,6 +2708,19 @@ button:disabled {
   font-size: 13px;
 }
 
+.nav-badge {
+  margin-left: auto;
+  min-width: 20px;
+  border-radius: 999px;
+  color: #ffffff;
+  background: #5360d9;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 20px;
+  text-align: center;
+  padding: 0 6px;
+}
+
 .sidebar-footer {
   display: flex;
   flex-direction: column;
@@ -2456,7 +2829,10 @@ button:disabled {
 }
 
 .live-page,
-.search-page {
+.current-page,
+.search-page,
+.search-result,
+.queue-page {
   display: flex;
   flex-direction: column;
   gap: 18px;
@@ -2502,6 +2878,184 @@ button:disabled {
   display: grid;
   min-height: calc(100vh - 52px);
   place-items: center;
+}
+
+.queue-summary,
+.queue-empty,
+.queue-card {
+  border: 1px solid #d7e5e1;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.88);
+  box-shadow: 0 12px 28px rgba(32, 67, 73, 0.06);
+}
+
+.queue-create-panel,
+.queue-summary,
+.queue-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 18px 20px;
+}
+
+.queue-create-panel {
+  gap: 12px;
+}
+
+.queue-create-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.queue-create-head strong {
+  color: #1f2a2e;
+  font-size: 16px;
+  font-weight: 900;
+}
+
+.queue-create-head span,
+.queue-create-state span {
+  color: #65757b;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.queue-create-box {
+  width: min(760px, 100%);
+}
+
+.queue-create-state {
+  display: flex;
+  min-height: 22px;
+  align-items: center;
+}
+
+.queue-create-state.success span {
+  color: #276c4f;
+}
+
+.queue-create-state.error span {
+  color: #9a3f47;
+}
+
+.queue-candidate-panel {
+  width: min(760px, 100%);
+}
+
+.queue-summary strong,
+.queue-empty strong,
+.queue-card-title strong {
+  color: #1f2a2e;
+  font-size: 16px;
+  font-weight: 900;
+}
+
+.queue-summary span,
+.queue-empty span,
+.queue-card-title span,
+.queue-card-meta span,
+.queue-card-message {
+  color: #65757b;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.queue-empty.error strong,
+.queue-empty.error span {
+  color: #9a3f47;
+}
+
+.queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.queue-history-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.queue-history-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.queue-history-head strong {
+  color: #1f2a2e;
+  font-size: 16px;
+  font-weight: 900;
+}
+
+.queue-history-head span {
+  color: #65757b;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.queue-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px 20px;
+}
+
+.queue-card-head,
+.queue-card-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.queue-card-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.queue-status {
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 900;
+  padding: 6px 10px;
+}
+
+.queue-status.running {
+  color: #2859a5;
+  background: rgba(83, 132, 219, 0.14);
+}
+
+.queue-status.retrying {
+  color: #986013;
+  background: rgba(214, 160, 55, 0.18);
+}
+
+.queue-status.pending {
+  color: #3a5f55;
+  background: rgba(90, 141, 129, 0.16);
+}
+
+.queue-status.completed {
+  color: #276c4f;
+  background: rgba(68, 172, 116, 0.16);
+}
+
+.queue-status.failed {
+  color: #9a3f47;
+  background: rgba(215, 94, 114, 0.16);
+}
+
+.queue-card-history {
+  background: rgba(252, 254, 253, 0.92);
+}
+
+.queue-card-message {
+  margin: 0;
 }
 
 .search-center {
@@ -2630,9 +3184,18 @@ button:disabled {
   text-align: left;
 }
 
+.queue-candidate-item {
+  width: 100%;
+}
+
 .candidate-item:hover {
   border-color: #a7ccc4;
   background: #edf5f3;
+}
+
+.candidate-item:disabled {
+  cursor: wait;
+  opacity: 0.72;
 }
 
 .candidate-item div {

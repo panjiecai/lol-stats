@@ -396,6 +396,10 @@ pub struct PlayerEloEstimateResponse {
     pub trimmed_game_max_elos: Vec<f64>,
     #[serde(default)]
     pub game_samples: Vec<PlayerEloGameSample>,
+    #[serde(default)]
+    pub scan_games: Vec<PlayerEloScanGame>,
+    #[serde(default)]
+    pub game_logs: Vec<PlayerEloGameLog>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -406,11 +410,161 @@ pub struct PlayerEloEstimateTaskStatus {
     #[serde(default)]
     pub status: String,
     #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub next_poll_delay_ms: u64,
+    #[serde(default)]
     pub cached: bool,
     #[serde(default)]
     pub result: Option<PlayerEloEstimateResponse>,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerEloQueueItem {
+    #[serde(default)]
+    pub job_id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub riot_id: String,
+    #[serde(default)]
+    pub sgp_server_id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub next_poll_delay_ms: u64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub current_elo: Option<f64>,
+    #[serde(default)]
+    pub sample_games: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerEloQueueSnapshot {
+    #[serde(default)]
+    pub active_items: Vec<PlayerEloQueueItem>,
+    #[serde(default)]
+    pub history_items: Vec<PlayerEloQueueItem>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedPlayerEloTaskRecord {
+    #[serde(default)]
+    pub job_id: String,
+    #[serde(default)]
+    pub puuid: String,
+    #[serde(default)]
+    pub game_name: String,
+    #[serde(default)]
+    pub tag_line: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub riot_id: String,
+    #[serde(default)]
+    pub sgp_server_id: String,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub status: PlayerEloEstimateTaskStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalEloLookupDebugResponse {
+    #[serde(default)]
+    pub riot_id: String,
+    #[serde(default)]
+    pub normalized_riot_id: String,
+    #[serde(default)]
+    pub sgp_server_id: String,
+    #[serde(default)]
+    pub area_id: u32,
+    #[serde(default)]
+    pub area_name: String,
+    #[serde(default)]
+    pub matched_riot_id: String,
+    #[serde(default)]
+    pub open_id: String,
+    #[serde(default)]
+    pub info_request_url: String,
+    #[serde(default)]
+    pub rank_request_url: String,
+    #[serde(default)]
+    pub info_payload: String,
+    #[serde(default)]
+    pub rank_payload: String,
+    #[serde(default)]
+    pub info_code: i32,
+    #[serde(default)]
+    pub rank_code: i32,
+    #[serde(default)]
+    pub extracted_rank_text: String,
+    #[serde(default)]
+    pub elo: Option<f64>,
+    #[serde(default)]
+    pub used_powershell: bool,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialApiProbeSample {
+    #[serde(default)]
+    pub game_id: u64,
+    #[serde(default)]
+    pub queue_id: u32,
+    #[serde(default)]
+    pub game_mode: String,
+    #[serde(default)]
+    pub game_creation: i64,
+    #[serde(default)]
+    pub champion_id: u32,
+    #[serde(default)]
+    pub summary_request_url: String,
+    #[serde(default)]
+    pub summary_payload: String,
+    #[serde(default)]
+    pub rank_like_paths: Vec<String>,
+    #[serde(default)]
+    pub first_participant_challenge_hits: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialApiDebugResponse {
+    #[serde(default)]
+    pub sgp_server_id: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub summoner: SummonerInfo,
+    #[serde(default)]
+    pub ranked_request_url: String,
+    #[serde(default)]
+    pub ranked_payload: String,
+    #[serde(default)]
+    pub ranked_like_paths: Vec<String>,
+    #[serde(default)]
+    pub match_history_request_url: String,
+    #[serde(default)]
+    pub match_history_payload: String,
+    #[serde(default)]
+    pub match_history_like_paths: Vec<String>,
+    #[serde(default)]
+    pub sample_games: Vec<OfficialApiProbeSample>,
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -428,6 +582,48 @@ pub struct PlayerEloGameSample {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PlayerEloScanGame {
+    #[serde(default)]
+    pub game_id: u64,
+    #[serde(default)]
+    pub game_creation: i64,
+    #[serde(default)]
+    pub queue_id: u32,
+    #[serde(default)]
+    pub game_mode: String,
+    #[serde(default)]
+    pub champion_id: u32,
+    #[serde(default)]
+    pub is_solo_game: bool,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerEloGameLog {
+    #[serde(default)]
+    pub game_id: u64,
+    #[serde(default)]
+    pub game_creation: i64,
+    #[serde(default)]
+    pub queue_id: u32,
+    #[serde(default)]
+    pub game_mode: String,
+    #[serde(default)]
+    pub champion_id: u32,
+    #[serde(default)]
+    pub included: bool,
+    #[serde(default)]
+    pub max_elo: Option<f64>,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub players: Vec<PlayerEloTraceParticipant>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PlayerEloParticipant {
     #[serde(default)]
     pub puuid: String,
@@ -441,6 +637,29 @@ pub struct PlayerEloParticipant {
     pub champion_id: u32,
     #[serde(default)]
     pub elo: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerEloTraceParticipant {
+    #[serde(default)]
+    pub puuid: String,
+    #[serde(default)]
+    pub summoner_name: String,
+    #[serde(default)]
+    pub game_name: String,
+    #[serde(default)]
+    pub tag_line: String,
+    #[serde(default)]
+    pub champion_id: u32,
+    #[serde(default)]
+    pub side: String,
+    #[serde(default)]
+    pub included: bool,
+    #[serde(default)]
+    pub elo: Option<f64>,
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -851,6 +1070,38 @@ pub struct LivePremadeMarker {
     pub source: String,
     pub together_times: usize,
     pub member_puuids: Vec<String>,
+}
+
+/// 指定账号的实时对局查询结果（SGP 观战服务）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerActiveGame {
+    pub in_game: bool,
+    pub game_id: Option<i64>,
+    pub queue_config_id: Option<i32>,
+    pub queue_type_name: Option<String>,
+    pub game_mode: Option<String>,
+    pub game_state: Option<String>,
+    pub teams: Vec<ActiveGameTeam>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveGameTeam {
+    pub name: String,
+    pub players: Vec<ActiveGamePlayer>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveGamePlayer {
+    pub puuid: String,
+    pub summoner_name: String,
+    pub champion_id: u32,
+    pub spell1_id: u32,
+    pub spell2_id: u32,
+    pub profile_icon_id: u32,
+    pub position: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

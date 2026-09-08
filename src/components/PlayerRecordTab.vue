@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from "vue"
+import { computed, ref, watch } from "vue"
 import { loadRankedStats, searchPlayer } from "../api"
 import type {
   ChampionSummaryItem,
@@ -9,10 +9,12 @@ import type {
   RankedStatsResponse,
   ShareSettings,
 } from "../types"
+import ActiveGamePanel from "./ActiveGamePanel.vue"
 import RecordView from "./RecordView.vue"
+import RecordWatchToolbar from "./RecordWatchToolbar.vue"
+import { MAX_RECENT_DEPTH, MAX_STATS_DEPTH } from "../statsDepth"
 
 const RECENT_PAGE_SIZE = 20
-const MAX_RECENT_DEPTH = 1000
 const DEFAULT_STATS_DEPTH = 100
 
 const props = defineProps<{
@@ -131,7 +133,7 @@ async function loadRanked(forceRefresh = false) {
 }
 
 function changeStatsDepth(depth: number) {
-  const nextDepth = Math.min(1000, Math.max(50, Math.round(Number(depth) || DEFAULT_STATS_DEPTH)))
+  const nextDepth = Math.min(MAX_STATS_DEPTH, Math.max(50, Math.round(Number(depth) || DEFAULT_STATS_DEPTH)))
   if (nextDepth === statsDepth.value && fullStats.value) return
 
   statsDepth.value = nextDepth
@@ -143,7 +145,7 @@ function changeStatsDepth(depth: number) {
 }
 
 function ensureStatsDepth(depth: number) {
-  const nextDepth = Math.min(1000, Math.max(50, Math.round(Number(depth) || DEFAULT_STATS_DEPTH)))
+  const nextDepth = Math.min(MAX_STATS_DEPTH, Math.max(50, Math.round(Number(depth) || DEFAULT_STATS_DEPTH)))
   if (nextDepth <= statsFetchDepth.value) return
 
   statsFetchDepth.value = nextDepth
@@ -158,30 +160,61 @@ watch(
   },
   { immediate: true },
 )
+
+const ownerPuuid = computed(
+  () => recentStats.value?.summoner?.puuid || fullStats.value?.summoner?.puuid || "",
+)
 </script>
 
 <template>
-  <RecordView
-    :recent-stats="recentStats"
-    :full-stats="fullStats"
-    :ranked-stats="rankedStats"
-    :ranked-loading="rankedLoading"
-    :share-settings="shareSettings"
-    :champions="champions"
-    :game-assets="gameAssets"
-    :loading="recentLoading || statsLoading"
-    :recent-loading="recentLoading"
-    :recent-has-more="recentHasMore"
-    :stats-depth="statsDepth"
-    :error="error"
-    :sgp-server-id="sgpServerId"
-    @load-recent="loadRecent"
-    @load-stats="loadStats"
-    @refresh-recent="loadRecent(true)"
-    @refresh-stats="loadStats(true)"
-    @load-recent-more="loadRecentMore"
-    @change-stats-depth="changeStatsDepth"
-    @ensure-stats-depth="ensureStatsDepth"
-    @open-match="emit('openMatch', $event)"
-  />
+  <div class="player-record-tab">
+    <ActiveGamePanel
+      v-if="ownerPuuid"
+      :puuid="ownerPuuid"
+      :sgp-server-id="sgpServerId"
+      :champions="champions"
+      :game-assets="gameAssets"
+    />
+    <RecordView
+      :recent-stats="recentStats"
+      :full-stats="fullStats"
+      :ranked-stats="rankedStats"
+      :ranked-loading="rankedLoading"
+      :share-settings="shareSettings"
+      :champions="champions"
+      :game-assets="gameAssets"
+      :loading="recentLoading || statsLoading"
+      :recent-loading="recentLoading"
+      :recent-has-more="recentHasMore"
+      :stats-depth="statsDepth"
+      :error="error"
+      :sgp-server-id="sgpServerId"
+      @load-recent="loadRecent"
+      @load-stats="loadStats"
+      @refresh-recent="loadRecent(true)"
+      @refresh-stats="loadStats(true)"
+      @load-recent-more="loadRecentMore"
+      @change-stats-depth="changeStatsDepth"
+      @ensure-stats-depth="ensureStatsDepth"
+      @open-match="emit('openMatch', $event)"
+    >
+      <template #toolbar>
+        <RecordWatchToolbar
+          :account-query="query"
+          :sgp-server-id="sgpServerId"
+          :champions="champions"
+          :game-assets="gameAssets"
+        />
+      </template>
+    </RecordView>
+  </div>
 </template>
+
+<style scoped>
+.player-record-tab {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 14px;
+}
+</style>

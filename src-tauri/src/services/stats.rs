@@ -1,21 +1,24 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures::stream::{self, StreamExt};
+use chrono::{Datelike, Local, Timelike};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 
 use super::error::{AppError, AppResult};
 use super::lcu::LcuClient;
 use super::models::{
-    ChampionStat, ClientAuth, Game, IdentityPlayer, MatchDetailPlayer, MatchDetailResponse,
-    MatchDetailTeam, Participant, PlayerEloEstimateResponse, PlayerEloGameSample,
-    PlayerEloParticipant, PlayerStatsResponse, PlayerSummary, RatingCompositionEntry,
-    RecentGame, RecentGameParticipantSummary, SummonerInfo,
+    ChampionStat, ClientAuth, ExternalEloLookupDebugResponse, Game, IdentityPlayer,
+    MatchDetailPlayer, MatchDetailResponse, MatchDetailTeam, Participant,
+    PersistedPlayerEloTaskRecord, PlayerEloEstimateResponse, PlayerEloGameLog, PlayerEloGameSample,
+    PlayerEloParticipant, PlayerEloScanGame, PlayerEloTraceParticipant, PlayerStatsResponse,
+    PlayerSummary, RatingCompositionEntry, RecentGame, RecentGameParticipantSummary, SummonerInfo,
 };
 use super::sgp::{resolve_sgp_server_id, SgpClient};
 
@@ -25,7 +28,9 @@ use super::sgp::{resolve_sgp_server_id, SgpClient};
 /// “已经没有更多数据”，导致 500 局统计实际只加载第一页。
 const MAX_PAGE_SIZE: usize = 50;
 const SGP_PAGE_SIZE: usize = 50;
-const MAX_DEPTH: usize = 1000;
+/// 单账号单次最多可加载的历史对局数（前端深度下拉同步到 MAX_STATS_DEPTH=3000）。
+/// 每页 50，3000 局约需 60 次分页请求；首次较慢，之后走 SQLite 增量缓存。
+const MAX_DEPTH: usize = 3000;
 const MIN_VALID_GAME_DURATION_SECONDS: i64 = 8 * 60;
 const STATS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DATABASE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
@@ -35,17 +40,18 @@ const HISTORY_PREMADE_THRESHOLD: usize = 3;
 const PLAYER_ELO_SAMPLE_TARGET: usize = 10;
 const PLAYER_ELO_BATCH_DEPTH: usize = 100;
 const PLAYER_ELO_MAX_DEPTH: usize = 1000;
-const PLAYER_ELO_PARTICIPANT_CONCURRENCY: usize = 4;
 const PLAYER_ELO_OWNER_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
-const PLAYER_ELO_PARTICIPANT_HTTP_TIMEOUT: Duration = Duration::from_secs(4);
-const PLAYER_ELO_PARTICIPANT_FETCH_BUDGET: Duration = Duration::from_secs(14);
-const PLAYER_ELO_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const PLAYER_ELO_PARTICIPANT_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+const PLAYER_ELO_PARTICIPANT_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
+const PLAYER_ELO_CACHE_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+const PLAYER_ELO_CACHE_NAMESPACE: &str = "player-elo-v3";
+const PLAYER_ELO_JOB_HISTORY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const EXTERNAL_ELO_SUCCESS_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
-const EXTERNAL_ELO_FAILURE_CACHE_TTL: Duration = Duration::from_secs(20);
+const EXTERNAL_ELO_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5);
 const EXTERNAL_ELO_DB_SUCCESS_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-const EXTERNAL_ELO_DB_FAILURE_CACHE_TTL: Duration = Duration::from_secs(20);
+const EXTERNAL_ELO_DB_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5);
 const EXTERNAL_ELO_OWNER_RETRY_COUNT: usize = 3;
-const EXTERNAL_ELO_PARTICIPANT_RETRY_COUNT: usize = 1;
+const EXTERNAL_ELO_PARTICIPANT_RETRY_COUNT: usize = 3;
 const EXTERNAL_ELO_RETRY_DELAY: Duration = Duration::from_millis(1100);
 const EXTERNAL_ELO_REFERER: &str = "https://a.lzyumi.top/";
 const EXTERNAL_ELO_USER_AGENT: &str =
@@ -172,12 +178,42 @@ const LZYUMI_SUPPORTED_AREAS: &[(u32, &str)] = &[
 
 #[derive(Clone)]
 struct EloParticipantSeed {
-    puuid: String,
     summoner_name: String,
     game_name: String,
     tag_line: String,
     champion_id: u32,
     game_ids: HashSet<u64>,
+    eligible_game_ids: HashSet<u64>,
+}
+
+#[derive(Clone)]
+struct EloGamePlayerSeed {
+    key: String,
+    puuid: String,
+    summoner_name: String,
+    game_name: String,
+    tag_line: String,
+    champion_id: u32,
+    side: String,
+    is_owner: bool,
+    is_solo_player: bool,
+}
+
+#[derive(Clone)]
+struct EloTracePlayerState {
+    key: String,
+    trace: PlayerEloTraceParticipant,
+    eligible_for_max_elo: bool,
+}
+
+#[derive(Clone)]
+struct EloGameLogState {
+    game_id: u64,
+    game_creation: i64,
+    queue_id: u32,
+    game_mode: String,
+    champion_id: u32,
+    players: Vec<EloTracePlayerState>,
 }
 
 #[derive(Clone, Copy)]
@@ -186,11 +222,17 @@ struct ExternalEloFetchOptions {
     retry_count: usize,
     retry_delay: Duration,
     allow_powershell_fallback: bool,
+    prefer_powershell: bool,
+    use_cache: bool,
 }
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LzyumiInfoResponse {
+    #[serde(default)]
+    code: i32,
+    #[serde(default)]
+    message: String,
     #[serde(default)]
     battle_info: Option<LzyumiBattleInfo>,
 }
@@ -208,6 +250,10 @@ struct LzyumiBattleInfo {
 #[serde(rename_all = "camelCase")]
 struct LzyumiEloResponse {
     #[serde(default)]
+    code: i32,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
     data: Option<LzyumiEloData>,
 }
 
@@ -216,6 +262,14 @@ struct LzyumiEloResponse {
 struct LzyumiEloData {
     #[serde(default)]
     data_rank_elo_num: String,
+    #[serde(default)]
+    data_rank_elo_info_a: String,
+    #[serde(default)]
+    data_rank_elo_info_b: String,
+    #[serde(default)]
+    data_rank_elo_info_c: String,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
 }
 
 /// 拉取并聚合某个玩家的历史战绩。
@@ -248,6 +302,22 @@ pub async fn load_match_detail(
     sgp_server_id: Option<&str>,
     game_id: u64,
 ) -> AppResult<MatchDetailResponse> {
+    // 本地已有该局完整缓存（含全 10 名玩家 augment）则直接返回，免网络往返。
+    // 这让「海克斯连号」这类批量逐局扫描几乎瞬时完成（只读 SQLite）。
+    // 与 stats_cache_key 保持同一 canonical server id 口径，确保命中已缓存对局。
+    let cache_server = if let Some(auth) = auth {
+        Some(resolve_sgp_server_id(auth, sgp_server_id))
+    } else {
+        sgp_server_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_ascii_uppercase())
+    };
+    if let Some(server) = cache_server {
+        if let Some(game) = read_db_cached_game(&server, game_id) {
+            return Ok(match_detail_from_game(game));
+        }
+    }
+
     if let Some(auth) = auth {
         if let Ok(sgp) = SgpClient::new(lcu, auth, sgp_server_id).await {
             if let Ok(game) = sgp.game_summary(game_id).await {
@@ -266,21 +336,39 @@ pub async fn estimate_player_elo(
     sgp_server_id: Option<&str>,
     summoner: SummonerInfo,
 ) -> AppResult<PlayerEloEstimateResponse> {
+    estimate_player_elo_with_progress(lcu, auth, sgp_server_id, summoner, |_partial, _message| {})
+        .await
+}
+
+pub async fn estimate_player_elo_with_progress<F>(
+    lcu: &LcuClient,
+    auth: &ClientAuth,
+    sgp_server_id: Option<&str>,
+    summoner: SummonerInfo,
+    mut on_progress: F,
+) -> AppResult<PlayerEloEstimateResponse>
+where
+    F: FnMut(PlayerEloEstimateResponse, String),
+{
     let cache_key = player_elo_cache_key(auth, sgp_server_id, &summoner);
     if let Some(cached) = read_db_cached_player_elo(&cache_key, false) {
         return Ok(cached);
     }
 
-    let response = match estimate_player_elo_uncached(lcu, auth, sgp_server_id, summoner).await {
-        Ok(response) => response,
-        Err(error) => {
-            if let Some(stale) = read_db_cached_player_elo(&cache_key, true) {
-                return Ok(stale);
+    let response =
+        match estimate_player_elo_uncached(lcu, auth, sgp_server_id, summoner, &mut on_progress)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(stale) = read_db_cached_player_elo(&cache_key, true) {
+                    return Ok(stale);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
     write_db_cached_player_elo(&cache_key, &response);
+    write_db_last_player_elo(&cache_key, &response);
     Ok(response)
 }
 
@@ -293,13 +381,23 @@ pub fn load_cached_player_elo(
     read_db_cached_player_elo(&cache_key, false)
 }
 
+pub fn load_last_player_elo(
+    auth: &ClientAuth,
+    sgp_server_id: Option<&str>,
+    summoner: &SummonerInfo,
+) -> Option<PlayerEloEstimateResponse> {
+    let cache_key = player_elo_cache_key(auth, sgp_server_id, summoner);
+    read_db_last_player_elo(&cache_key)
+}
+
 pub fn clear_player_elo_cache(
     auth: &ClientAuth,
     sgp_server_id: Option<&str>,
     summoner: &SummonerInfo,
 ) -> AppResult<bool> {
     let cache_key = player_elo_cache_key(auth, sgp_server_id, summoner);
-    Ok(delete_db_cached_player_elo(&cache_key).unwrap_or(false))
+    let deleted = delete_db_cached_player_elo(&cache_key).unwrap_or(false);
+    Ok(deleted)
 }
 
 async fn estimate_player_elo_uncached(
@@ -307,19 +405,47 @@ async fn estimate_player_elo_uncached(
     auth: &ClientAuth,
     sgp_server_id: Option<&str>,
     summoner: SummonerInfo,
+    on_progress: &mut impl FnMut(PlayerEloEstimateResponse, String),
 ) -> AppResult<PlayerEloEstimateResponse> {
     let resolved_sgp_server_id = resolve_sgp_server_id(auth, sgp_server_id);
 
     let owner_stats =
         load_stats_until_solo_sample(lcu, auth, Some(resolved_sgp_server_id.as_str()), &summoner)
             .await?;
-    let solo_games = owner_stats
-        .recent_games
-        .iter()
-        .filter(|game| is_solo_game(game))
-        .take(PLAYER_ELO_SAMPLE_TARGET)
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut solo_games = Vec::new();
+    let mut scan_games = Vec::new();
+    for game in &owner_stats.recent_games {
+        let is_solo = is_solo_game(game);
+        scan_games.push(PlayerEloScanGame {
+            game_id: game.game_id,
+            game_creation: game.game_creation,
+            queue_id: game.queue_id,
+            game_mode: game.game_mode.clone(),
+            champion_id: game.champion_id,
+            is_solo_game: is_solo,
+            note: if is_solo {
+                "命中单人开局样本".to_string()
+            } else {
+                let premade_source = if game.premade_source.trim().is_empty() {
+                    "历史同队"
+                } else {
+                    game.premade_source.trim()
+                };
+                format!(
+                    "非单人开局：命中 {} 名疑似同队玩家（{}）",
+                    game.premade_teammate_puuids.len(),
+                    premade_source
+                )
+            },
+        });
+
+        if is_solo {
+            solo_games.push(game.clone());
+            if solo_games.len() >= PLAYER_ELO_SAMPLE_TARGET {
+                break;
+            }
+        }
+    }
 
     if solo_games.is_empty() {
         return Err(AppError::InvalidInput(
@@ -327,16 +453,16 @@ async fn estimate_player_elo_uncached(
         ));
     }
 
-    let mut game_players = HashMap::<u64, Vec<String>>::new();
+    let mut game_players = HashMap::<u64, Vec<EloGamePlayerSeed>>::new();
     let mut participants = HashMap::<String, EloParticipantSeed>::new();
     let normalized_owner_puuid = normalize_puuid(&summoner.puuid);
     let mut owner_identity = EloParticipantSeed {
-        puuid: summoner.puuid.clone(),
         summoner_name: summoner.display_name.clone(),
         game_name: summoner.game_name.clone(),
         tag_line: summoner.tag_line.clone(),
         champion_id: 0,
         game_ids: HashSet::new(),
+        eligible_game_ids: HashSet::new(),
     };
 
     for game in &solo_games {
@@ -359,7 +485,16 @@ async fn estimate_player_elo_uncached(
             if key.is_empty() {
                 continue;
             }
+            let is_solo_player = is_solo_detail_player(&player, &detail_players);
 
+            let player_riot_id =
+                normalized_riot_id(player.game_name.as_str(), player.tag_line.as_str());
+            let owner_riot_id =
+                normalized_riot_id(summoner.game_name.as_str(), summoner.tag_line.as_str());
+            let is_owner = (!normalized_owner_puuid.is_empty()
+                && is_real_puuid(&player.puuid)
+                && normalize_puuid(&player.puuid) == normalized_owner_puuid)
+                || (!owner_riot_id.is_empty() && player_riot_id == owner_riot_id);
             if !normalized_owner_puuid.is_empty()
                 && is_real_puuid(&player.puuid)
                 && normalize_puuid(&player.puuid) == normalized_owner_puuid
@@ -380,23 +515,39 @@ async fn estimate_player_elo_uncached(
             game_players
                 .entry(game.game_id)
                 .or_default()
-                .push(key.clone());
-
-            let is_solo_in_detail = is_solo_detail_player(&player, &detail_players);
-            participants
-                .entry(key)
-                .and_modify(|entry| {
-                    if is_solo_in_detail {
-                        entry.game_ids.insert(game.game_id);
-                    }
-                })
-                .or_insert_with(|| EloParticipantSeed {
+                .push(EloGamePlayerSeed {
+                    key: key.clone(),
                     puuid: player.puuid.clone(),
                     summoner_name: player.summoner_name.clone(),
                     game_name: player.game_name.clone(),
                     tag_line: player.tag_line.clone(),
                     champion_id: player.record.champion_id,
-                    game_ids: if is_solo_in_detail {
+                    side: if is_owner {
+                        "自己".to_string()
+                    } else if player.team_id == game.team_id {
+                        "队友".to_string()
+                    } else {
+                        "对手".to_string()
+                    },
+                    is_owner,
+                    is_solo_player,
+                });
+
+            participants
+                .entry(key)
+                .and_modify(|entry| {
+                    entry.game_ids.insert(game.game_id);
+                    if is_solo_player && !is_owner {
+                        entry.eligible_game_ids.insert(game.game_id);
+                    }
+                })
+                .or_insert_with(|| EloParticipantSeed {
+                    summoner_name: player.summoner_name.clone(),
+                    game_name: player.game_name.clone(),
+                    tag_line: player.tag_line.clone(),
+                    champion_id: player.record.champion_id,
+                    game_ids: HashSet::from([game.game_id]),
+                    eligible_game_ids: if is_solo_player && !is_owner {
                         HashSet::from([game.game_id])
                     } else {
                         HashSet::new()
@@ -405,6 +556,59 @@ async fn estimate_player_elo_uncached(
         }
     }
 
+    let mut game_states = solo_games
+        .iter()
+        .map(|game| {
+            let players = game_players
+                .get(&game.game_id)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| EloTracePlayerState {
+                            key: entry.key.clone(),
+                            trace: PlayerEloTraceParticipant {
+                                puuid: entry.puuid.clone(),
+                                summoner_name: display_name_from_parts(
+                                    entry.summoner_name.as_str(),
+                                    entry.game_name.as_str(),
+                                    entry.tag_line.as_str(),
+                                ),
+                                game_name: entry.game_name.clone(),
+                                tag_line: entry.tag_line.clone(),
+                                champion_id: entry.champion_id,
+                                side: entry.side.clone(),
+                                included: false,
+                                elo: None,
+                                note: if entry.is_owner {
+                                    "当前角色，不参与该局最高 ELO 计算".to_string()
+                                } else if entry.is_solo_player {
+                                    "单人开局，等待外部 ELO 查询".to_string()
+                                } else {
+                                    "非单人开局，不参与该局最高 ELO 计算".to_string()
+                                },
+                            },
+                            eligible_for_max_elo: !entry.is_owner && entry.is_solo_player,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            EloGameLogState {
+                game_id: game.game_id,
+                game_creation: game.game_creation,
+                queue_id: game.queue_id,
+                game_mode: game.game_mode.clone(),
+                champion_id: game.champion_id,
+                players,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let owner_riot_id = normalized_riot_id(
+        owner_identity.game_name.as_str(),
+        owner_identity.tag_line.as_str(),
+    );
+
     let area = resolve_lzyumi_area_for_summoner(
         &resolved_sgp_server_id,
         owner_identity.game_name.as_str(),
@@ -412,6 +616,14 @@ async fn estimate_player_elo_uncached(
         Some(owner_identity.summoner_name.as_str()),
     )
     .await?;
+    on_progress(
+        summarize_player_elo_from_states(PLAYER_ELO_SAMPLE_TARGET, &scan_games, &game_states),
+        format!(
+            "已识别外部区服 {}，开始查询当前角色和同局玩家 ELO",
+            area.name
+        ),
+    );
+
     let owner_elo = fetch_external_aram_elo(
         &area,
         owner_identity.game_name.as_str(),
@@ -424,141 +636,135 @@ async fn estimate_player_elo_uncached(
         owner_identity.game_name.as_str(),
         owner_identity.tag_line.as_str(),
     );
+    on_progress(
+        summarize_player_elo_from_states(PLAYER_ELO_SAMPLE_TARGET, &scan_games, &game_states),
+        match owner_elo {
+            Some(value) => format!(
+                "当前角色 {} 在外部站点已命中 ELO {:.1}，继续抓同局样本",
+                owner_display_name, value
+            ),
+            None => format!(
+                "当前角色 {} 在外部站点未直接查到 ELO，继续抓同局样本",
+                owner_display_name
+            ),
+        },
+    );
 
-    let mut solo_game_sets = HashMap::<String, HashSet<u64>>::new();
-    let mut elo_values = HashMap::<String, f64>::new();
     let mut participant_entries = participants
         .iter()
-        .filter(|(_, participant)| !participant.game_ids.is_empty())
+        .filter(|(_, participant)| {
+            !participant.eligible_game_ids.is_empty()
+                && normalized_riot_id(
+                    participant.game_name.as_str(),
+                    participant.tag_line.as_str(),
+                ) != owner_riot_id
+        })
         .map(|(key, participant)| (key.clone(), participant.clone()))
         .collect::<Vec<_>>();
     participant_entries.sort_by(|left, right| {
         right
             .1
-            .game_ids
+            .eligible_game_ids
             .len()
-            .cmp(&left.1.game_ids.len())
+            .cmp(&left.1.eligible_game_ids.len())
             .then_with(|| left.0.cmp(&right.0))
     });
+    let participant_total = participant_entries.len();
 
-    let mut participant_results = stream::iter(participant_entries.into_iter().map(
-        |(key, participant)| {
-            let area = area.clone();
-            let options = participant_external_elo_fetch_options();
+    on_progress(
+        summarize_player_elo_from_states(PLAYER_ELO_SAMPLE_TARGET, &scan_games, &game_states),
+        format!(
+            "已锁定 {} 局单人开局，准备查询 {} 名同局队友/对手 ELO",
+            solo_games.len(),
+            participant_total
+        ),
+    );
 
-            async move {
-                let elo = match fetch_external_aram_elo_with_options(
-                    &area,
-                    participant.game_name.as_str(),
-                    participant.tag_line.as_str(),
-                    Some(participant.summoner_name.as_str()),
-                    options,
-                )
-                .await
-                {
-                    Ok(Some(elo)) => elo,
-                    _ => return None,
-                };
-
-                Some((key, participant.game_ids, elo))
-            }
-        },
-    ))
-    .buffer_unordered(PLAYER_ELO_PARTICIPANT_CONCURRENCY);
-
-    let participant_deadline = Instant::now() + PLAYER_ELO_PARTICIPANT_FETCH_BUDGET;
-    loop {
-        let remaining = participant_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
+    let mut resolved_participants = 0usize;
+    let mut success_participants = 0usize;
+    for (index, (key, participant)) in participant_entries.into_iter().enumerate() {
+        if index > 0 {
+            on_progress(
+                summarize_player_elo_from_states(
+                    PLAYER_ELO_SAMPLE_TARGET,
+                    &scan_games,
+                    &game_states,
+                ),
+                format!(
+                    "外部站点限流保护：等待 {} 秒后再查询下一名同局玩家（{}/{participant_total}）",
+                    PLAYER_ELO_PARTICIPANT_REQUEST_INTERVAL.as_secs(),
+                    resolved_participants + 1
+                ),
+            );
+            tokio::time::sleep(PLAYER_ELO_PARTICIPANT_REQUEST_INTERVAL).await;
         }
 
-        let next_result = match tokio::time::timeout(remaining, participant_results.next()).await {
-            Ok(value) => value,
-            Err(_) => break,
-        };
-        let Some(result) = next_result else {
-            break;
-        };
-        let Some((key, solo_game_ids, elo)) = result else {
-            continue;
-        };
-        solo_game_sets.insert(key.clone(), solo_game_ids);
-        elo_values.insert(key, elo);
-    }
+        let fetch_result = fetch_external_aram_elo_with_options(
+            &area,
+            participant.game_name.as_str(),
+            participant.tag_line.as_str(),
+            Some(participant.summoner_name.as_str()),
+            participant_external_elo_fetch_options(),
+        )
+        .await;
+        resolved_participants += 1;
+        let participant_name = display_name_from_parts(
+            participant.summoner_name.as_str(),
+            participant.game_name.as_str(),
+            participant.tag_line.as_str(),
+        );
 
-    let mut game_samples = Vec::new();
-    for game in &solo_games {
-        let mut solo_players = game_players
-            .get(&game.game_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|key| {
-                let game_ids = solo_game_sets.get(key)?;
-                if !game_ids.contains(&game.game_id) {
-                    return None;
-                }
-
-                let participant = participants.get(key)?;
-                let elo = *elo_values.get(key)?;
-
-                Some(PlayerEloParticipant {
-                    puuid: participant.puuid.clone(),
-                    summoner_name: display_name_from_parts(
-                        participant.summoner_name.as_str(),
-                        participant.game_name.as_str(),
-                        participant.tag_line.as_str(),
+        let (resolved_elo, note, progress_message) = match fetch_result {
+            Ok(Some(elo)) => {
+                success_participants += 1;
+                let rounded = round2(elo);
+                (
+                    Some(rounded),
+                    "ELO 命中".to_string(),
+                    format!(
+                        "外部已命中 {success_participants}/{participant_total} 名同局玩家：{participant_name} = {:.1}",
+                        rounded
                     ),
-                    game_name: participant.game_name.clone(),
-                    tag_line: participant.tag_line.clone(),
-                    champion_id: participant.champion_id,
-                    elo: round2(elo),
-                })
-            })
-            .collect::<Vec<_>>();
+                )
+            }
+            Ok(None) => (
+                None,
+                "这次已拿到资料页，但 rank 接口没返回 ELO 数值，可能是外站瞬时异常".to_string(),
+                format!(
+                    "外部这次没返回 {participant_name} 的 ELO 数值，正在按重试规则继续推进（已处理 {resolved_participants}/{participant_total}）"
+                ),
+            ),
+            Err(error) => (
+                None,
+                error.to_string(),
+                format!(
+                    "查询 {participant_name} 失败：{}（已处理 {resolved_participants}/{participant_total}）",
+                    error
+                ),
+            ),
+        };
 
-        if let Some(owner_elo) = owner_elo {
-            let owner_exists = solo_players.iter().any(|player| {
-                is_real_puuid(&owner_stats.summoner.puuid)
-                    && is_real_puuid(&player.puuid)
-                    && normalize_puuid(&player.puuid) == normalize_puuid(&owner_stats.summoner.puuid)
-            }) || solo_players.iter().any(|player| {
-                normalized_riot_id(player.game_name.as_str(), player.tag_line.as_str())
-                    == normalized_riot_id(
-                        owner_stats.summoner.game_name.as_str(),
-                        owner_stats.summoner.tag_line.as_str(),
-                    )
-            });
-
-            if !owner_exists {
-                solo_players.push(PlayerEloParticipant {
-                    puuid: owner_identity.puuid.clone(),
-                    summoner_name: owner_display_name.clone(),
-                    game_name: owner_identity.game_name.clone(),
-                    tag_line: owner_identity.tag_line.clone(),
-                    champion_id: if owner_identity.champion_id != 0 {
-                        owner_identity.champion_id
-                    } else {
-                        game.champion_id
-                    },
-                    elo: round2(owner_elo),
-                });
+        for state in &mut game_states {
+            for player in &mut state.players {
+                if player.key != key || player.trace.side == "自己" || !player.eligible_for_max_elo
+                {
+                    continue;
+                }
+                player.trace.included = resolved_elo.is_some();
+                player.trace.elo = resolved_elo;
+                player.trace.note = note.clone();
             }
         }
 
-        solo_players.sort_by(|left, right| right.elo.total_cmp(&left.elo));
-
-        if let Some(max_elo) = solo_players.first().map(|player| player.elo) {
-            game_samples.push(PlayerEloGameSample {
-                game_id: game.game_id,
-                game_creation: game.game_creation,
-                max_elo: max_elo,
-                solo_players,
-            });
-        }
+        on_progress(
+            summarize_player_elo_from_states(PLAYER_ELO_SAMPLE_TARGET, &scan_games, &game_states),
+            progress_message,
+        );
     }
 
-    if game_samples.is_empty() {
+    let response =
+        summarize_player_elo_from_states(PLAYER_ELO_SAMPLE_TARGET, &scan_games, &game_states);
+    if response.game_samples.is_empty() {
         if owner_elo.is_none() {
             return Err(AppError::SgpUnavailable(format!(
                 "在 ELO 查询网站上用用户名 {} 和区服 {} 无法查到 ELO 分数",
@@ -567,38 +773,13 @@ async fn estimate_player_elo_uncached(
         }
 
         return Err(AppError::SgpUnavailable(format!(
-            "外部 ELO 服务暂时没有返回可用样本（单人对局 {} 局，命中玩家 ELO {} 人）",
+            "外部 ELO 服务暂时没有返回完整样本（单人对局 {} 局，命中同局队友/对手 ELO {} 人）",
             solo_games.len(),
-            elo_values.len()
+            success_participants
         )));
     }
 
-    let raw_game_max_elos = game_samples
-        .iter()
-        .map(|sample| sample.max_elo)
-        .collect::<Vec<_>>();
-    let trimmed_game_max_elos = trim_extreme_elos(&raw_game_max_elos);
-    let scoring_values = if trimmed_game_max_elos.is_empty() {
-        raw_game_max_elos.clone()
-    } else {
-        trimmed_game_max_elos.clone()
-    };
-
-    let average_elo = round2(mean(&scoring_values));
-    let median_elo = round2(median(&scoring_values));
-    let final_elo = round2((average_elo + median_elo) / 2.0);
-
-    Ok(PlayerEloEstimateResponse {
-        sample_target: PLAYER_ELO_SAMPLE_TARGET,
-        sample_games: game_samples.len(),
-        trimmed_games: scoring_values.len(),
-        average_elo,
-        median_elo,
-        final_elo,
-        raw_game_max_elos: raw_game_max_elos.iter().copied().map(round2).collect(),
-        trimmed_game_max_elos: scoring_values.iter().copied().map(round2).collect(),
-        game_samples,
-    })
+    Ok(response)
 }
 
 pub async fn load_player_stats_with_progress<F>(
@@ -711,8 +892,10 @@ fn player_elo_cache_key(
     sgp_server_id: Option<&str>,
     summoner: &SummonerInfo,
 ) -> PlayerEloCacheKey {
+    let resolved_sgp_server_id = resolve_sgp_server_id(auth, sgp_server_id);
     PlayerEloCacheKey {
-        sgp_server_id: resolve_sgp_server_id(auth, sgp_server_id),
+        // 角色 ELO 算法迭代后必须切走旧缓存，否则会出现新旧结果混用。
+        sgp_server_id: format!("{resolved_sgp_server_id}::{PLAYER_ELO_CACHE_NAMESPACE}"),
         puuid: summoner.puuid.to_ascii_lowercase(),
     }
 }
@@ -873,7 +1056,287 @@ fn write_db_cached_player_elo(key: &PlayerEloCacheKey, response: &PlayerEloEstim
             stored_at_ms = excluded.stored_at_ms,
             response_json = excluded.response_json
         "#,
-        params![&key.sgp_server_id, &key.puuid, unix_time_ms(), response_json],
+        params![
+            &key.sgp_server_id,
+            &key.puuid,
+            unix_time_ms(),
+            response_json
+        ],
+    );
+}
+
+fn read_db_last_player_elo(key: &PlayerEloCacheKey) -> Option<PlayerEloEstimateResponse> {
+    let conn = open_cache_db()?;
+    let response_json: String = conn
+        .query_row(
+            r#"
+            SELECT response_json
+            FROM player_elo_last_cache
+            WHERE sgp_server_id = ?1
+              AND puuid = ?2
+            "#,
+            params![&key.sgp_server_id, &key.puuid],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()??;
+
+    serde_json::from_str::<PlayerEloEstimateResponse>(&response_json).ok()
+}
+
+fn write_db_last_player_elo(key: &PlayerEloCacheKey, response: &PlayerEloEstimateResponse) {
+    let Some(conn) = open_cache_db() else {
+        return;
+    };
+
+    let Ok(response_json) = serde_json::to_string(response) else {
+        return;
+    };
+
+    let _ = conn.execute(
+        r#"
+        INSERT INTO player_elo_last_cache (
+            sgp_server_id,
+            puuid,
+            stored_at_ms,
+            response_json
+        )
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(sgp_server_id, puuid) DO UPDATE SET
+            stored_at_ms = excluded.stored_at_ms,
+            response_json = excluded.response_json
+        "#,
+        params![
+            &key.sgp_server_id,
+            &key.puuid,
+            unix_time_ms(),
+            response_json
+        ],
+    );
+}
+
+pub fn read_player_elo_job(job_id: &str) -> Option<PersistedPlayerEloTaskRecord> {
+    let conn = open_cache_db()?;
+    let (
+        puuid,
+        game_name,
+        tag_line,
+        display_name,
+        riot_id,
+        sgp_server_id,
+        updated_at_ms,
+        status_json,
+    ): (String, String, String, String, String, String, i64, String) = conn
+        .query_row(
+            r#"
+            SELECT
+                puuid,
+                game_name,
+                tag_line,
+                display_name,
+                riot_id,
+                sgp_server_id,
+                updated_at_ms,
+                status_json
+            FROM player_elo_job_cache
+            WHERE job_id = ?1
+            "#,
+            params![job_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()
+        .ok()??;
+
+    Some(PersistedPlayerEloTaskRecord {
+        job_id: job_id.to_string(),
+        puuid,
+        game_name,
+        tag_line,
+        display_name,
+        riot_id,
+        sgp_server_id,
+        updated_at_ms,
+        status: serde_json::from_str(&status_json).ok()?,
+    })
+}
+
+pub fn load_player_elo_jobs() -> Vec<PersistedPlayerEloTaskRecord> {
+    let Some(conn) = open_cache_db() else {
+        return Vec::new();
+    };
+
+    let mut stmt = match conn.prepare(
+        r#"
+        SELECT
+            job_id,
+            puuid,
+            game_name,
+            tag_line,
+            display_name,
+            riot_id,
+            sgp_server_id,
+            updated_at_ms,
+            status_json
+        FROM player_elo_job_cache
+        ORDER BY updated_at_ms DESC
+        "#,
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, String>(8)?,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    rows.filter_map(|row| {
+        let (
+            job_id,
+            puuid,
+            game_name,
+            tag_line,
+            display_name,
+            riot_id,
+            sgp_server_id,
+            updated_at_ms,
+            status_json,
+        ) = row.ok()?;
+
+        Some(PersistedPlayerEloTaskRecord {
+            job_id,
+            puuid,
+            game_name,
+            tag_line,
+            display_name,
+            riot_id,
+            sgp_server_id,
+            updated_at_ms,
+            status: serde_json::from_str(&status_json).ok()?,
+        })
+    })
+    .collect()
+}
+
+pub fn write_player_elo_job(record: &PersistedPlayerEloTaskRecord) {
+    let Some(conn) = open_cache_db() else {
+        return;
+    };
+
+    let Ok(status_json) = serde_json::to_string(&record.status) else {
+        return;
+    };
+
+    let _ = conn.execute(
+        r#"
+        INSERT INTO player_elo_job_cache (
+            job_id,
+            puuid,
+            game_name,
+            tag_line,
+            display_name,
+            riot_id,
+            sgp_server_id,
+            updated_at_ms,
+            status_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(job_id) DO UPDATE SET
+            puuid = excluded.puuid,
+            game_name = excluded.game_name,
+            tag_line = excluded.tag_line,
+            display_name = excluded.display_name,
+            riot_id = excluded.riot_id,
+            sgp_server_id = excluded.sgp_server_id,
+            updated_at_ms = excluded.updated_at_ms,
+            status_json = excluded.status_json
+        "#,
+        params![
+            &record.job_id,
+            &record.puuid,
+            &record.game_name,
+            &record.tag_line,
+            &record.display_name,
+            &record.riot_id,
+            &record.sgp_server_id,
+            record.updated_at_ms,
+            status_json
+        ],
+    );
+}
+
+pub fn delete_duplicate_player_elo_jobs(
+    puuid: &str,
+    canonical_job_id: &str,
+    canonical_sgp_server_id: &str,
+) {
+    let Some(conn) = open_cache_db() else {
+        return;
+    };
+
+    let normalized_puuid = puuid.trim();
+    let normalized_job_id = canonical_job_id.trim();
+    let normalized_sgp_server_id = canonical_sgp_server_id.trim().to_ascii_uppercase();
+    let legacy_unknown_job_id = format!("unknown:{normalized_puuid}");
+
+    let _ = conn.execute(
+        r#"
+        DELETE FROM player_elo_job_cache
+        WHERE puuid = ?1
+          AND job_id <> ?2
+          AND (
+              UPPER(TRIM(sgp_server_id)) = ?3
+              OR job_id = ?4
+          )
+        "#,
+        params![
+            normalized_puuid,
+            normalized_job_id,
+            normalized_sgp_server_id,
+            legacy_unknown_job_id
+        ],
+    );
+}
+
+pub fn prune_player_elo_job_history() {
+    let Some(conn) = open_cache_db() else {
+        return;
+    };
+
+    let retention_ms =
+        i64::try_from(PLAYER_ELO_JOB_HISTORY_RETENTION.as_millis()).unwrap_or(i64::MAX);
+    let cutoff_ms = unix_time_ms().saturating_sub(retention_ms);
+
+    let _ = conn.execute(
+        r#"
+        DELETE FROM player_elo_job_cache
+        WHERE updated_at_ms < ?1
+          AND json_extract(status_json, '$.status') IN ('completed', 'failed')
+        "#,
+        params![cutoff_ms],
     );
 }
 
@@ -912,13 +1375,15 @@ fn read_db_cached_external_elo(cache_key: &str, allow_stale: bool) -> Option<Opt
         return None;
     }
 
-    Some(elo)
+    Some(normalize_external_elo_value(elo))
 }
 
 fn write_db_cached_external_elo(cache_key: &str, elo: Option<f64>) {
     let Some(conn) = open_cache_db() else {
         return;
     };
+
+    let elo = normalize_external_elo_value(elo);
 
     let ttl = if elo.is_some() {
         EXTERNAL_ELO_DB_SUCCESS_CACHE_TTL
@@ -1002,6 +1467,29 @@ fn initialize_cache_schema(conn: &Connection) -> rusqlite::Result<()> {
             response_json TEXT NOT NULL,
             PRIMARY KEY (sgp_server_id, puuid)
         );
+
+        CREATE TABLE IF NOT EXISTS player_elo_last_cache (
+            sgp_server_id TEXT NOT NULL,
+            puuid TEXT NOT NULL,
+            stored_at_ms INTEGER NOT NULL,
+            response_json TEXT NOT NULL,
+            PRIMARY KEY (sgp_server_id, puuid)
+        );
+
+        CREATE TABLE IF NOT EXISTS player_elo_job_cache (
+            job_id TEXT NOT NULL PRIMARY KEY,
+            puuid TEXT NOT NULL,
+            game_name TEXT NOT NULL,
+            tag_line TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            riot_id TEXT NOT NULL,
+            sgp_server_id TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            status_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_player_elo_job_recent
+            ON player_elo_job_cache (updated_at_ms DESC);
 
         CREATE TABLE IF NOT EXISTS external_elo_cache (
             cache_key TEXT NOT NULL PRIMARY KEY,
@@ -1194,6 +1682,30 @@ fn count_db_cached_games(key: &StatsCacheKey) -> Option<usize> {
         .ok()?;
 
     count.try_into().ok()
+}
+
+/// 从本地 match_cache 按 (sgp_server_id, game_id) 精确取某一局完整 Game（含全 10 名玩家的
+/// augment/数据）。命中即可免走网络（SGP/LCU）直接出详情，用于海克斯连号等批量逐局扫描。
+fn read_db_cached_game(server_id: &str, game_id: u64) -> Option<Game> {
+    let conn = open_cache_db()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT game_json
+            FROM match_cache
+            WHERE sgp_server_id = ?1 AND game_id = ?2
+            "#,
+        )
+        .ok()?;
+    let mut rows = stmt
+        .query_map(params![server_id, game_id as i64], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()?;
+    let Some(Ok(json)) = rows.next() else {
+        return None;
+    };
+    serde_json::from_str::<Game>(&json).ok()
 }
 
 fn read_db_cached_games(key: &StatsCacheKey, depth: usize) -> Option<Vec<Game>> {
@@ -1873,10 +2385,7 @@ fn infer_recent_game_premades(owner_puuid: &str, recent_games: &mut [RecentGame]
             continue;
         };
 
-        game.premade_teammate_puuids = group
-            .into_iter()
-            .filter(|puuid| puuid != &owner)
-            .collect();
+        game.premade_teammate_puuids = group.into_iter().filter(|puuid| puuid != &owner).collect();
         game.premade_source = "历史同队".to_string();
         game.premade_together_times = together_times;
     }
@@ -1984,14 +2493,8 @@ async fn load_stats_until_solo_sample(
     let mut depth = PLAYER_ELO_BATCH_DEPTH;
 
     loop {
-        let stats = load_player_stats(
-            lcu,
-            Some(auth),
-            sgp_server_id,
-            summoner.clone(),
-            depth,
-        )
-        .await?;
+        let stats =
+            load_player_stats(lcu, Some(auth), sgp_server_id, summoner.clone(), depth).await?;
 
         let solo_games = stats
             .recent_games
@@ -2020,6 +2523,133 @@ fn elo_participant_key(player: &MatchDetailPlayer) -> String {
 
 fn is_solo_game(game: &RecentGame) -> bool {
     (game.premade_teammate_puuids.len()) == 0
+}
+
+fn trace_side_order(side: &str) -> u8 {
+    match side {
+        "自己" => 0,
+        "队友" => 1,
+        "对手" => 2,
+        _ => 3,
+    }
+}
+
+fn summarize_player_elo_from_states(
+    sample_target: usize,
+    scan_games: &[PlayerEloScanGame],
+    game_states: &[EloGameLogState],
+) -> PlayerEloEstimateResponse {
+    let mut game_logs = Vec::new();
+    let mut game_samples = Vec::new();
+
+    for state in game_states {
+        let expected_count = state
+            .players
+            .iter()
+            .filter(|player| player.eligible_for_max_elo)
+            .count();
+        let resolved_players = state
+            .players
+            .iter()
+            .filter(|player| player.eligible_for_max_elo && player.trace.elo.is_some())
+            .map(|player| PlayerEloParticipant {
+                puuid: player.trace.puuid.clone(),
+                summoner_name: player.trace.summoner_name.clone(),
+                game_name: player.trace.game_name.clone(),
+                tag_line: player.trace.tag_line.clone(),
+                champion_id: player.trace.champion_id,
+                elo: round2(player.trace.elo.unwrap_or_default()),
+            })
+            .collect::<Vec<_>>();
+        let resolved_count = resolved_players.len();
+        let mut trace_players = state
+            .players
+            .iter()
+            .map(|player| player.trace.clone())
+            .collect::<Vec<_>>();
+        trace_players.sort_by(|left, right| {
+            trace_side_order(left.side.as_str())
+                .cmp(&trace_side_order(right.side.as_str()))
+                .then_with(|| {
+                    let left_elo = left.elo.unwrap_or(-1.0);
+                    let right_elo = right.elo.unwrap_or(-1.0);
+                    right_elo.total_cmp(&left_elo)
+                })
+                .then_with(|| left.summoner_name.cmp(&right.summoner_name))
+        });
+
+        let (included, max_elo, note) = if expected_count == 0 {
+            (false, None, "该局没有可统计的单人开局队友/对手".to_string())
+        } else if resolved_count == expected_count {
+            let max_elo = resolved_players
+                .iter()
+                .map(|player| player.elo)
+                .max_by(|left, right| left.total_cmp(right));
+            let note = max_elo
+                .map(|value| format!("该局已拿齐全部单人开局队友/对手 ELO，最高值 {:.1}", value))
+                .unwrap_or_else(|| "该局已拿齐全部单人开局队友/对手 ELO".to_string());
+            (true, max_elo, note)
+        } else {
+            (
+                false,
+                None,
+                format!(
+                    "该局已命中 {resolved_count}/{expected_count} 名单人开局队友/对手 ELO，继续查询"
+                ),
+            )
+        };
+
+        if included {
+            if let Some(value) = max_elo {
+                game_samples.push(PlayerEloGameSample {
+                    game_id: state.game_id,
+                    game_creation: state.game_creation,
+                    max_elo: value,
+                    solo_players: resolved_players,
+                });
+            }
+        }
+
+        game_logs.push(PlayerEloGameLog {
+            game_id: state.game_id,
+            game_creation: state.game_creation,
+            queue_id: state.queue_id,
+            game_mode: state.game_mode.clone(),
+            champion_id: state.champion_id,
+            included,
+            max_elo: max_elo.map(round2),
+            note,
+            players: trace_players,
+        });
+    }
+
+    let raw_game_max_elos = game_samples
+        .iter()
+        .map(|sample| sample.max_elo)
+        .collect::<Vec<_>>();
+    let trimmed_game_max_elos = trim_extreme_elos(&raw_game_max_elos);
+    let scoring_values = if trimmed_game_max_elos.is_empty() {
+        raw_game_max_elos.clone()
+    } else {
+        trimmed_game_max_elos.clone()
+    };
+    let average_elo = round2(mean(&scoring_values));
+    let median_elo = round2(median(&scoring_values));
+    let final_elo = round2((average_elo + median_elo) / 2.0);
+
+    PlayerEloEstimateResponse {
+        sample_target,
+        sample_games: game_samples.len(),
+        trimmed_games: scoring_values.len(),
+        average_elo,
+        median_elo,
+        final_elo,
+        raw_game_max_elos: raw_game_max_elos.iter().copied().map(round2).collect(),
+        trimmed_game_max_elos: scoring_values.iter().copied().map(round2).collect(),
+        game_samples,
+        scan_games: scan_games.to_vec(),
+        game_logs,
+    }
 }
 
 fn is_solo_detail_player(player: &MatchDetailPlayer, players: &[MatchDetailPlayer]) -> bool {
@@ -2122,10 +2752,7 @@ fn lzyumi_area_candidates_for_sgp_server(sgp_server_id: &str) -> Vec<EloArea> {
 
     LZYUMI_SUPPORTED_AREAS
         .iter()
-        .map(|(id, name)| EloArea {
-            id: *id,
-            name,
-        })
+        .map(|(id, name)| EloArea { id: *id, name })
         .collect()
 }
 
@@ -2199,12 +2826,233 @@ async fn fetch_external_aram_elo(
     .await
 }
 
+pub async fn debug_external_elo_lookup(
+    riot_id: &str,
+    sgp_server_id: &str,
+) -> AppResult<ExternalEloLookupDebugResponse> {
+    let (game_name, tag_line) = split_riot_id(riot_id).ok_or_else(|| {
+        AppError::InvalidInput("Riot ID 格式不正确，必须是 名称#标签".to_string())
+    })?;
+    let normalized_id = normalized_riot_id(game_name.as_str(), tag_line.as_str());
+    let area = if let Some(area) = lzyumi_area_for_sgp_server(sgp_server_id) {
+        area
+    } else {
+        resolve_lzyumi_area_for_summoner(
+            sgp_server_id,
+            game_name.as_str(),
+            tag_line.as_str(),
+            Some(riot_id),
+        )
+        .await?
+    };
+
+    let external_nickname = external_search_nickname(normalized_id.as_str());
+    let options = owner_external_elo_fetch_options();
+    let http = build_external_elo_http_client(options.http_timeout)?;
+    let area_id = area.id.to_string();
+    let mut debug = ExternalEloLookupDebugResponse {
+        riot_id: riot_id.trim().to_string(),
+        normalized_riot_id: normalized_id.clone(),
+        sgp_server_id: sgp_server_id.to_string(),
+        area_id: area.id,
+        area_name: area.name.to_string(),
+        used_powershell: options.prefer_powershell,
+        note: "尚未开始诊断".to_string(),
+        ..Default::default()
+    };
+
+    for attempt in 0..options.retry_count {
+        let (sign, sign_str) = lzyumi_sign_components();
+        let info_params = vec![
+            ("nickname", external_nickname.clone()),
+            ("allCount", "10".to_string()),
+            ("areaId", area_id.clone()),
+            ("areaName", area.name.to_string()),
+            ("seleMe", "1".to_string()),
+            ("filter", "5".to_string()),
+            ("openId", String::new()),
+            ("lzyumiSign", sign.clone()),
+            ("signStr", sign_str.clone()),
+        ];
+        debug.info_request_url =
+            build_external_request_url("https://a.lzyumi.top/lzyumi/lol/info", &info_params);
+        let info_text = if options.prefer_powershell {
+            fetch_external_info_text_via_powershell(&area, external_nickname.as_str())?
+        } else {
+            http.get("https://a.lzyumi.top/lzyumi/lol/info")
+                .query(&info_params)
+                .send()
+                .await?
+                .text()
+                .await?
+        };
+        debug.info_payload = info_text.clone();
+
+        let info = match parse_external_json::<LzyumiInfoResponse>(&info_text, "外部 ELO info 响应")
+        {
+            Ok(value) => value,
+            Err(error) => {
+                debug.info_code = 0;
+                debug.note = format!("第 {} 次 info 解析失败：{}", attempt + 1, error);
+                if attempt + 1 < options.retry_count {
+                    tokio::time::sleep(options.retry_delay).await;
+                    continue;
+                }
+                return Ok(debug);
+            }
+        };
+        debug.info_code = info.code;
+
+        let Some(battle_info) = info.battle_info else {
+            debug.note = format!(
+                "第 {} 次 info 返回缺少 battleInfo（code={}, message={}）",
+                attempt + 1,
+                info.code,
+                info.message
+            );
+            if attempt + 1 < options.retry_count {
+                tokio::time::sleep(options.retry_delay).await;
+                continue;
+            }
+            return Ok(debug);
+        };
+
+        debug.matched_riot_id = battle_info.name_info_new.trim().to_string();
+        debug.open_id = battle_info.open_id.trim().to_string();
+
+        if debug.open_id.is_empty() {
+            debug.note = format!("第 {} 次 info 虽命中资料页，但 openId 为空", attempt + 1);
+            if attempt + 1 < options.retry_count {
+                tokio::time::sleep(options.retry_delay).await;
+                continue;
+            }
+            return Ok(debug);
+        }
+
+        let returned_id = normalize_search_name(&battle_info.name_info_new);
+        if !returned_id.is_empty() && returned_id != normalize_search_name(&normalized_id) {
+            debug.note = format!(
+                "第 {} 次 info 命中了其他玩家：{}",
+                attempt + 1,
+                battle_info.name_info_new.trim()
+            );
+            if attempt + 1 < options.retry_count {
+                tokio::time::sleep(options.retry_delay).await;
+                continue;
+            }
+            return Ok(debug);
+        }
+
+        let (sign, sign_str) = lzyumi_sign_components();
+        let elo_params = vec![
+            ("openId", battle_info.open_id.clone()),
+            ("areaId", area_id.clone()),
+            ("lzyumiSign", sign),
+            ("signStr", sign_str),
+            ("filter", "5".to_string()),
+        ];
+        debug.rank_request_url = build_external_request_url(
+            "https://a.lzyumi.top/lzyumi/lol/info/getRankEloInfo",
+            &elo_params,
+        );
+        let rank_text = if options.prefer_powershell {
+            fetch_external_rank_text_via_powershell(battle_info.open_id.as_str(), area.id, 5)?
+        } else {
+            http.get("https://a.lzyumi.top/lzyumi/lol/info/getRankEloInfo")
+                .query(&elo_params)
+                .send()
+                .await?
+                .text()
+                .await?
+        };
+        debug.rank_payload = rank_text.clone();
+
+        let rank = match parse_external_json::<LzyumiEloResponse>(&rank_text, "外部 ELO rank 响应")
+        {
+            Ok(value) => value,
+            Err(error) => {
+                debug.rank_code = 0;
+                debug.note = format!("第 {} 次 rank 解析失败：{}", attempt + 1, error);
+                if attempt + 1 < options.retry_count {
+                    tokio::time::sleep(options.retry_delay).await;
+                    continue;
+                }
+                return Ok(debug);
+            }
+        };
+        debug.rank_code = rank.code;
+
+        debug.extracted_rank_text = rank
+            .data
+            .as_ref()
+            .map(extract_lzyumi_aram_elo_text)
+            .unwrap_or_default();
+        debug.elo = normalize_external_elo_value(parse_lzyumi_elo(
+            debug.extracted_rank_text.as_str(),
+        ));
+
+        if let Some(elo) = debug.elo {
+            debug.note = format!(
+                "第 {} 次诊断成功：命中 {} 的大乱斗 ELO {:.1}",
+                attempt + 1,
+                debug
+                    .matched_riot_id
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(debug.matched_riot_id.as_str()),
+                elo
+            );
+            return Ok(debug);
+        }
+
+        debug.note = format!(
+            "第 {} 次 rank 已返回，但没有从文本 {:?} 中解析出 ELO（code={}, message={}）",
+            attempt + 1,
+            debug.extracted_rank_text,
+            rank.code,
+            rank.message
+        );
+        if attempt + 1 < options.retry_count {
+            tokio::time::sleep(options.retry_delay).await;
+            continue;
+        }
+    }
+
+    Ok(debug)
+}
+
+pub async fn probe_player_external_elo(
+    auth: &ClientAuth,
+    sgp_server_id: Option<&str>,
+    summoner: &SummonerInfo,
+) -> AppResult<Option<f64>> {
+    let resolved_sgp_server_id = resolve_sgp_server_id(auth, sgp_server_id);
+    let area = resolve_lzyumi_area_for_summoner(
+        &resolved_sgp_server_id,
+        summoner.game_name.as_str(),
+        summoner.tag_line.as_str(),
+        Some(summoner.display_name.as_str()),
+    )
+    .await?;
+
+    fetch_external_aram_elo_with_options(
+        &area,
+        summoner.game_name.as_str(),
+        summoner.tag_line.as_str(),
+        Some(summoner.display_name.as_str()),
+        owner_external_elo_probe_options(),
+    )
+    .await
+}
+
 fn owner_external_elo_fetch_options() -> ExternalEloFetchOptions {
     ExternalEloFetchOptions {
         http_timeout: PLAYER_ELO_OWNER_HTTP_TIMEOUT,
         retry_count: EXTERNAL_ELO_OWNER_RETRY_COUNT,
         retry_delay: EXTERNAL_ELO_RETRY_DELAY,
         allow_powershell_fallback: true,
+        prefer_powershell: false,
+        use_cache: true,
     }
 }
 
@@ -2214,6 +3062,19 @@ fn participant_external_elo_fetch_options() -> ExternalEloFetchOptions {
         retry_count: EXTERNAL_ELO_PARTICIPANT_RETRY_COUNT,
         retry_delay: EXTERNAL_ELO_RETRY_DELAY,
         allow_powershell_fallback: true,
+        prefer_powershell: false,
+        use_cache: true,
+    }
+}
+
+fn owner_external_elo_probe_options() -> ExternalEloFetchOptions {
+    ExternalEloFetchOptions {
+        http_timeout: PLAYER_ELO_OWNER_HTTP_TIMEOUT,
+        retry_count: 1,
+        retry_delay: EXTERNAL_ELO_RETRY_DELAY,
+        allow_powershell_fallback: true,
+        prefer_powershell: false,
+        use_cache: false,
     }
 }
 
@@ -2228,14 +3089,17 @@ async fn fetch_external_aram_elo_with_options(
     if normalized_id.is_empty() {
         return Ok(None);
     }
+    let external_nickname = external_search_nickname(normalized_id.as_str());
 
     let cache_key = format!("{}:{}", area.id, normalized_id);
-    if let Some(cached) = get_cached_external_elo(&cache_key) {
-        return Ok(cached);
-    }
-    if let Some(cached) = read_db_cached_external_elo(&cache_key, false) {
-        store_cached_external_elo(cache_key.clone(), cached);
-        return Ok(cached);
+    if options.use_cache {
+        if let Some(cached) = get_cached_external_elo(&cache_key) {
+            return Ok(cached);
+        }
+        if let Some(cached) = read_db_cached_external_elo(&cache_key, false) {
+            store_cached_external_elo(cache_key.clone(), cached);
+            return Ok(cached);
+        }
     }
 
     let http = build_external_elo_http_client(options.http_timeout)?;
@@ -2244,9 +3108,8 @@ async fn fetch_external_aram_elo_with_options(
 
     for attempt in 0..options.retry_count {
         let (sign, sign_str) = lzyumi_sign_components();
-        let request_nonce = external_elo_request_nonce();
         let info_params = vec![
-            ("nickname", normalized_id.clone()),
+            ("nickname", external_nickname.clone()),
             ("allCount", "10".to_string()),
             ("areaId", area_id.clone()),
             ("areaName", area.name.to_string()),
@@ -2255,19 +3118,24 @@ async fn fetch_external_aram_elo_with_options(
             ("openId", String::new()),
             ("lzyumiSign", sign.clone()),
             ("signStr", sign_str.clone()),
-            ("_t", request_nonce.clone()),
         ];
-        let info_text = http
-            .get("https://a.lzyumi.top/lzyumi/lol/info")
-            .query(&info_params)
-            .send()
-            .await?
-            .text()
-            .await?;
+        let info_text = if options.prefer_powershell {
+            fetch_external_info_text_via_powershell(area, external_nickname.as_str())?
+        } else {
+            http.get("https://a.lzyumi.top/lzyumi/lol/info")
+                .query(&info_params)
+                .send()
+                .await?
+                .text()
+                .await?
+        };
         let mut info = parse_external_json::<LzyumiInfoResponse>(&info_text, "外部 ELO info 响应")?;
-        if info.battle_info.is_none() && options.allow_powershell_fallback {
+        if info.battle_info.is_none()
+            && options.allow_powershell_fallback
+            && !options.prefer_powershell
+        {
             let fallback_text =
-                fetch_external_info_text_via_powershell(area, normalized_id.as_str())?;
+                fetch_external_info_text_via_powershell(area, external_nickname.as_str())?;
             info = parse_external_json::<LzyumiInfoResponse>(
                 &fallback_text,
                 "外部 ELO info 回退响应",
@@ -2300,45 +3168,46 @@ async fn fetch_external_aram_elo_with_options(
         }
 
         let (sign, sign_str) = lzyumi_sign_components();
-        let request_nonce = external_elo_request_nonce();
         let elo_params = vec![
             ("openId", battle_info.open_id.clone()),
             ("areaId", area_id.clone()),
             ("lzyumiSign", sign),
             ("signStr", sign_str),
             ("filter", "5".to_string()),
-            ("_t", request_nonce),
         ];
-        let elo_text = http
-            .get("https://a.lzyumi.top/lzyumi/lol/info/getRankEloInfo")
-            .query(&elo_params)
-            .send()
-            .await?
-            .text()
-            .await?
-            ;
+        let elo_text = if options.prefer_powershell {
+            fetch_external_rank_text_via_powershell(battle_info.open_id.as_str(), area.id, 5)?
+        } else {
+            http.get("https://a.lzyumi.top/lzyumi/lol/info/getRankEloInfo")
+                .query(&elo_params)
+                .send()
+                .await?
+                .text()
+                .await?
+        };
         let mut elo_response =
             parse_external_json::<LzyumiEloResponse>(&elo_text, "外部 ELO rank 响应")?;
         let mut elo_text_value = elo_response
             .data
             .as_ref()
-            .map(|data| data.data_rank_elo_num.trim().to_string())
+            .map(extract_lzyumi_aram_elo_text)
             .unwrap_or_default();
-        if elo_text_value.is_empty() && options.allow_powershell_fallback {
+        if elo_text_value.is_empty()
+            && options.allow_powershell_fallback
+            && !options.prefer_powershell
+        {
             let fallback_text =
                 fetch_external_rank_text_via_powershell(battle_info.open_id.as_str(), area.id, 5)?;
-            elo_response = parse_external_json::<LzyumiEloResponse>(
-                &fallback_text,
-                "外部 ELO rank 回退响应",
-            )?;
+            elo_response =
+                parse_external_json::<LzyumiEloResponse>(&fallback_text, "外部 ELO rank 回退响应")?;
             elo_text_value = elo_response
                 .data
                 .as_ref()
-                .map(|data| data.data_rank_elo_num.trim().to_string())
+                .map(extract_lzyumi_aram_elo_text)
                 .unwrap_or_default();
         }
 
-        parsed = parse_lzyumi_elo(elo_text_value.as_str());
+        parsed = normalize_external_elo_value(parse_lzyumi_elo(elo_text_value.as_str()));
         if parsed.is_some() || attempt + 1 >= options.retry_count {
             break;
         }
@@ -2346,15 +3215,17 @@ async fn fetch_external_aram_elo_with_options(
         tokio::time::sleep(options.retry_delay).await;
     }
 
-    if parsed.is_none() {
+    if parsed.is_none() && options.use_cache {
         if let Some(stale_elo) = read_db_cached_external_elo(&cache_key, true).flatten() {
             store_cached_external_elo(cache_key, Some(stale_elo));
             return Ok(Some(stale_elo));
         }
     }
 
-    store_cached_external_elo(cache_key.clone(), parsed);
-    write_db_cached_external_elo(&cache_key, parsed);
+    if options.use_cache {
+        store_cached_external_elo(cache_key.clone(), parsed);
+        write_db_cached_external_elo(&cache_key, parsed);
+    }
     Ok(parsed)
 }
 
@@ -2373,6 +3244,7 @@ fn get_cached_external_elo(cache_key: &str) -> Option<Option<f64>> {
 }
 
 fn store_cached_external_elo(cache_key: String, elo: Option<f64>) {
+    let elo = normalize_external_elo_value(elo);
     if let Ok(mut cache) = EXTERNAL_ELO_CACHE.lock() {
         cache.insert(
             cache_key,
@@ -2387,6 +3259,10 @@ fn store_cached_external_elo(cache_key: String, elo: Option<f64>) {
             },
         );
     }
+}
+
+fn normalize_external_elo_value(elo: Option<f64>) -> Option<f64> {
+    elo.filter(|value| value.is_finite() && *value > 0.0)
 }
 
 fn build_external_elo_http_client(timeout: Duration) -> AppResult<reqwest::Client> {
@@ -2439,12 +3315,14 @@ fn build_external_elo_http_client(timeout: Duration) -> AppResult<reqwest::Clien
         .build()?)
 }
 
-fn external_elo_request_nonce() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .to_string()
+fn build_external_request_url(base: &str, params: &[(&str, String)]) -> String {
+    let query = params
+        .iter()
+        .map(|(key, value)| format!("{}={}", key, urlencoding::encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    format!("{base}?{query}")
 }
 
 fn parse_external_json<T>(text: &str, context: &str) -> AppResult<T>
@@ -2455,7 +3333,10 @@ where
         .map_err(|error| AppError::InvalidInput(format!("{context} 解析失败：{error}")))
 }
 
-fn fetch_external_info_text_via_powershell(area: &EloArea, normalized_id: &str) -> AppResult<String> {
+fn fetch_external_info_text_via_powershell(
+    area: &EloArea,
+    normalized_id: &str,
+) -> AppResult<String> {
     let nickname = normalized_id.replace('\'', "''");
     let area_name = area.name.replace('\'', "''");
     let script = format!(
@@ -2487,15 +3368,21 @@ fn fetch_external_rank_text_via_powershell(
 }
 
 fn run_powershell_script(script: &str) -> AppResult<String> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ])
-        .output()?;
+    #[cfg(windows)]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut command = Command::new("powershell");
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        script,
+    ]);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let output = command.output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -2513,16 +3400,12 @@ fn run_powershell_script(script: &str) -> AppResult<String> {
 }
 
 fn lzyumi_sign_components() -> (String, String) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let total_seconds = now % 86_400;
-    let hours = (total_seconds / 3_600) as u32;
-    let minutes = ((total_seconds % 3_600) / 60) as u32;
-    let seconds = (total_seconds % 60) as u32;
-    let days_since_epoch = (now / 86_400) as i64;
-    let (_, month, day) = civil_from_days(days_since_epoch);
+    let now = Local::now();
+    let month = now.month();
+    let day = now.day();
+    let hours = now.hour();
+    let minutes = now.minute();
+    let seconds = now.second();
 
     let month_raw = month.to_string();
     let day_raw = day.to_string();
@@ -2552,21 +3435,6 @@ fn lzyumi_sign_components() -> (String, String) {
     (sign, sign_str)
 }
 
-fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
-    let z = days_since_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + if month <= 2 { 1 } else { 0 };
-
-    (year as i32, month as u32, day as u32)
-}
-
 fn parse_lzyumi_elo(value: &str) -> Option<f64> {
     let digits = value
         .chars()
@@ -2578,6 +3446,49 @@ fn parse_lzyumi_elo(value: &str) -> Option<f64> {
     }
 
     digits.parse::<f64>().ok()
+}
+
+fn extract_lzyumi_aram_elo_text(data: &LzyumiEloData) -> String {
+    let direct_candidates = [
+        data.data_rank_elo_num.as_str(),
+        data.data_rank_elo_info_a.as_str(),
+        data.data_rank_elo_info_b.as_str(),
+        data.data_rank_elo_info_c.as_str(),
+    ];
+
+    for candidate in direct_candidates {
+        let text = candidate.trim();
+        if text.contains("大乱斗") && parse_lzyumi_elo(text).is_some() {
+            return text.to_string();
+        }
+    }
+
+    for candidate in direct_candidates {
+        let text = candidate.trim();
+        if parse_lzyumi_elo(text).is_some() {
+            return text.to_string();
+        }
+    }
+
+    for value in data.extra.values() {
+        let Some(text) = value.as_str().map(str::trim) else {
+            continue;
+        };
+        if text.contains("大乱斗") && parse_lzyumi_elo(text).is_some() {
+            return text.to_string();
+        }
+    }
+
+    for value in data.extra.values() {
+        let Some(text) = value.as_str().map(str::trim) else {
+            continue;
+        };
+        if parse_lzyumi_elo(text).is_some() {
+            return text.to_string();
+        }
+    }
+
+    String::new()
 }
 
 fn display_name_from_parts(summoner_name: &str, game_name: &str, tag_line: &str) -> String {
@@ -2605,6 +3516,23 @@ fn normalized_riot_id(game_name: &str, tag_line: &str) -> String {
     }
 
     format!("{normalized_game_name}#{normalized_tag_line}")
+}
+
+fn split_riot_id(riot_id: &str) -> Option<(String, String)> {
+    let trimmed = riot_id.trim();
+    let (game_name, tag_line) = trimmed.split_once('#')?;
+    let game_name = game_name.trim();
+    let tag_line = tag_line.trim();
+
+    if game_name.is_empty() || tag_line.is_empty() {
+        return None;
+    }
+
+    Some((game_name.to_string(), tag_line.to_string()))
+}
+
+fn external_search_nickname(riot_id: &str) -> String {
+    riot_id.trim().replace('#', "*~*~*")
 }
 
 fn normalized_riot_id_with_fallback(
@@ -2873,7 +3801,8 @@ fn same_stat_team(game: &Game, me: &Participant, other: &Participant) -> bool {
 
 fn should_group_by_subteam(game: &Game) -> bool {
     matches!(game.game_mode.as_str(), "CHERRY" | "STRAWBERRY" | "KIWI")
-        || matches!(game.queue_id, 1700 | 1710 | 1711 | 1712 | 2400)
+        || game.game_mode.starts_with("KIWI_")
+        || matches!(game.queue_id, 1700 | 1710 | 1711 | 1712 | 2400 | 2410 | 2450)
 }
 
 fn calc_kda(kills: u32, deaths: u32, assists: u32) -> f64 {
@@ -3110,6 +4039,105 @@ mod tests {
         assert!(is_solo_detail_player(&player, &players));
     }
 
+    #[test]
+    fn summarize_player_elo_only_counts_solo_start_players_for_game_max() {
+        let response = summarize_player_elo_from_states(
+            10,
+            &[],
+            &[EloGameLogState {
+                game_id: 1,
+                game_creation: 1000,
+                queue_id: 450,
+                game_mode: "ARAM".to_string(),
+                champion_id: 266,
+                players: vec![
+                    EloTracePlayerState {
+                        key: "owner".to_string(),
+                        eligible_for_max_elo: false,
+                        trace: PlayerEloTraceParticipant {
+                            puuid: "owner".to_string(),
+                            summoner_name: "自己".to_string(),
+                            side: "自己".to_string(),
+                            note: "当前角色，不参与该局最高 ELO 计算".to_string(),
+                            ..Default::default()
+                        },
+                    },
+                    EloTracePlayerState {
+                        key: "solo".to_string(),
+                        eligible_for_max_elo: true,
+                        trace: PlayerEloTraceParticipant {
+                            puuid: "solo".to_string(),
+                            summoner_name: "单人玩家".to_string(),
+                            game_name: "Solo".to_string(),
+                            tag_line: "1111".to_string(),
+                            side: "队友".to_string(),
+                            included: true,
+                            elo: Some(2500.0),
+                            note: "ELO 命中".to_string(),
+                            ..Default::default()
+                        },
+                    },
+                    EloTracePlayerState {
+                        key: "premade".to_string(),
+                        eligible_for_max_elo: false,
+                        trace: PlayerEloTraceParticipant {
+                            puuid: "premade".to_string(),
+                            summoner_name: "组队玩家".to_string(),
+                            game_name: "Premade".to_string(),
+                            tag_line: "2222".to_string(),
+                            side: "对手".to_string(),
+                            included: false,
+                            elo: Some(3200.0),
+                            note: "非单人开局，不参与该局最高 ELO 计算".to_string(),
+                            ..Default::default()
+                        },
+                    },
+                ],
+            }],
+        );
+
+        assert_eq!(response.game_samples.len(), 1);
+        assert_eq!(response.game_samples[0].max_elo, 2500.0);
+        assert_eq!(response.game_samples[0].solo_players.len(), 1);
+        assert_eq!(response.game_samples[0].solo_players[0].puuid, "solo");
+        assert_eq!(response.game_logs[0].max_elo, Some(2500.0));
+    }
+
+    #[test]
+    fn parse_lzyumi_elo_accepts_labeled_text() {
+        assert_eq!(parse_lzyumi_elo("大乱斗：3158"), Some(3158.0));
+        assert_eq!(parse_lzyumi_elo("单双：2500"), Some(2500.0));
+    }
+
+    #[test]
+    fn normalize_external_elo_value_rejects_zero_and_invalid_numbers() {
+        assert_eq!(normalize_external_elo_value(Some(3158.0)), Some(3158.0));
+        assert_eq!(normalize_external_elo_value(Some(0.0)), None);
+        assert_eq!(normalize_external_elo_value(Some(-1.0)), None);
+        assert_eq!(normalize_external_elo_value(Some(f64::NAN)), None);
+    }
+
+    #[test]
+    fn extract_lzyumi_aram_elo_text_prefers_aram_field() {
+        let data = LzyumiEloData {
+            data_rank_elo_num: String::new(),
+            data_rank_elo_info_a: "单双：2500".to_string(),
+            data_rank_elo_info_b: "大乱斗：3158".to_string(),
+            data_rank_elo_info_c: "灵活：2682".to_string(),
+            extra: HashMap::new(),
+        };
+
+        assert_eq!(extract_lzyumi_aram_elo_text(&data), "大乱斗：3158");
+    }
+
+    #[test]
+    fn external_search_nickname_rewrites_riot_separator() {
+        assert_eq!(
+            external_search_nickname("不再迷茫#87602"),
+            "不再迷茫*~*~*87602"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "手动触发：诊断当前角色的外部大乱斗 ELO 查询"]
     async fn manual_fetch_current_owner_external_elo() {
@@ -3147,8 +4175,8 @@ mod tests {
         let summoner = lcu.current_summoner().await.expect("应能读取当前召唤师");
         let sgp_server_id = resolve_sgp_server_id(&auth, None);
         let area = lzyumi_area_for_sgp_server(&sgp_server_id).expect("当前大区应支持外部 ELO");
-        let http =
-            build_external_elo_http_client(PLAYER_ELO_OWNER_HTTP_TIMEOUT).expect("应能创建 HTTP client");
+        let http = build_external_elo_http_client(PLAYER_ELO_OWNER_HTTP_TIMEOUT)
+            .expect("应能创建 HTTP client");
         let (sign, sign_str) = lzyumi_sign_components();
         let area_id = area.id.to_string();
         let normalized_id = normalized_riot_id_with_fallback(
@@ -3156,11 +4184,12 @@ mod tests {
             summoner.tag_line.as_str(),
             Some(summoner.display_name.as_str()),
         );
+        let external_nickname = external_search_nickname(normalized_id.as_str());
 
         let info_text = http
             .get("https://a.lzyumi.top/lzyumi/lol/info")
             .query(&vec![
-                ("nickname", normalized_id.clone()),
+                ("nickname", external_nickname),
                 ("allCount", "10".to_string()),
                 ("areaId", area_id.clone()),
                 ("areaName", area.name.to_string()),
@@ -3169,7 +4198,6 @@ mod tests {
                 ("openId", String::new()),
                 ("lzyumiSign", sign.clone()),
                 ("signStr", sign_str.clone()),
-                ("_t", external_elo_request_nonce()),
             ])
             .send()
             .await
@@ -3180,7 +4208,8 @@ mod tests {
 
         println!("info payload => {}", info_text);
 
-        let info = serde_json::from_str::<LzyumiInfoResponse>(&info_text).expect("info JSON 应可解析");
+        let info =
+            serde_json::from_str::<LzyumiInfoResponse>(&info_text).expect("info JSON 应可解析");
         let Some(battle_info) = info.battle_info else {
             return;
         };
@@ -3194,7 +4223,6 @@ mod tests {
                 ("lzyumiSign", sign),
                 ("signStr", sign_str),
                 ("filter", "5".to_string()),
-                ("_t", external_elo_request_nonce()),
             ])
             .send()
             .await
@@ -3215,10 +4243,29 @@ mod tests {
         };
         let info_text = fetch_external_info_text_via_powershell(
             &area,
-            "离于爱者无忧无怖#53258",
+            external_search_nickname("离于爱者无忧无怖#53258").as_str(),
         )
         .expect("PowerShell info 请求应成功");
 
         println!("powershell info payload => {}", info_text);
+    }
+
+    #[tokio::test]
+    #[ignore = "手动触发：诊断指定 Riot ID 的外部大乱斗 ELO 查询"]
+    async fn manual_debug_reported_external_elo_lookup() {
+        let response = debug_external_elo_lookup("不再迷茫#87602", "TENCENT_HN10")
+            .await
+            .expect("诊断查询应成功返回");
+
+        println!(
+            "manual_debug_reported_external_elo_lookup => area='{}' matched='{}' elo={:?} extracted='{}' note='{}'",
+            response.area_name,
+            response.matched_riot_id,
+            response.elo,
+            response.extracted_rank_text,
+            response.note,
+        );
+        println!("info payload => {}", response.info_payload);
+        println!("rank payload => {}", response.rank_payload);
     }
 }

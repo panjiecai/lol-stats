@@ -15,7 +15,7 @@ import type {
   MatchDetailResponse,
   RecentGame,
 } from "../types"
-import { fixed, formatDate, mitigationValue, teamMitigationValue } from "../utils"
+import { computeBull, fixed, formatDate, mitigationValue, teamMitigationValue } from "../utils"
 import AssetIcon from "./AssetIcon.vue"
 import ChampionAvatar from "./ChampionAvatar.vue"
 
@@ -38,6 +38,11 @@ const props = defineProps<{
   champions: Record<number, ChampionSummaryItem>
   gameAssets: GameAssetBundle
   sgpServerId?: string
+  ownerLabel?: string
+  ownerPuuid?: string
+  teamOnly?: number
+  hideActions?: boolean
+  compactColumns?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -55,6 +60,15 @@ const spellMap = computed(() => indexAssets(props.gameAssets.summonerSpells))
 const itemMap = computed(() => indexAssets(props.gameAssets.items))
 const perkMap = computed(() => indexAssets(props.gameAssets.perks))
 const augmentMap = computed(() => indexAssets(props.gameAssets.augments))
+const normalizedOwnerPuuid = computed(() => props.ownerPuuid?.trim().toLowerCase() || "")
+const normalizedOwnerLabel = computed(() => props.ownerLabel?.trim().toLowerCase() || "")
+const visibleTeams = computed(() => {
+  const teams = props.matchDetail?.teams || []
+  if (typeof props.teamOnly === "number") {
+    return teams.filter((team) => team.teamId === props.teamOnly)
+  }
+  return teams
+})
 const ratingContext = computed(() => ({
   items: itemMap.value,
   champions: props.champions,
@@ -92,6 +106,8 @@ function queueName(game: RecentGame | MatchDetailResponse) {
     1712: "斗魂竞技场",
     1900: "无限火力",
     2400: "海克斯大乱斗",
+    2410: "海斗大赛",
+    2450: "海克斯大乱斗",
   }
 
   return map[game.queueId] || game.gameMode || `队列 ${game.queueId}`
@@ -113,6 +129,10 @@ function kNumber(value: number) {
   return `${(value / 1000).toFixed(1)}k`
 }
 
+function fullNumber(value: number) {
+  return value.toLocaleString("en-US")
+}
+
 function damageConversion(game: RecentGame) {
   const goldShare = ratio(game.goldEarned, game.teamGoldEarned)
   if (goldShare === 0) return "0.00"
@@ -122,6 +142,15 @@ function damageConversion(game: RecentGame) {
 function playerLabel(player: MatchDetailPlayer) {
   if (player.gameName && player.tagLine) return `${player.gameName}#${player.tagLine}`
   return player.summonerName || player.puuid || "未知玩家"
+}
+
+function isOwnerPlayer(player: MatchDetailPlayer) {
+  const playerPuuid = player.puuid?.trim().toLowerCase() || ""
+  if (normalizedOwnerPuuid.value && playerPuuid === normalizedOwnerPuuid.value) {
+    return true
+  }
+
+  return !!normalizedOwnerLabel.value && playerLabel(player).trim().toLowerCase() === normalizedOwnerLabel.value
 }
 
 function teamSummary(team: MatchDetailResponse["teams"][number]) {
@@ -167,6 +196,15 @@ function detailStatLeader(
     case "conversion":
       return game.teamDamageConversionLeader
   }
+}
+
+function bullOf(player: MatchDetailPlayer) {
+  return computeBull(player.damageToChampions)
+}
+
+function bullTitle(player: MatchDetailPlayer) {
+  const bull = bullOf(player)
+  return `伤害 ${player.damageToChampions} → 牌面 ${bull.digits} · ${bull.hasBull ? bull.label : `没牛 · ${bull.label}`}（0 按 10 点计）`
 }
 
 function outputRating(game: RecentGame) {
@@ -333,7 +371,13 @@ function abilityQueueMatches(game: RecentGame, source: RecentGame | MatchDetailR
 }
 
 function isHexAram(queueId: number, gameMode: string) {
-  return queueId === 2400 || ["STRAWBERRY", "KIWI"].includes(gameMode.toUpperCase())
+  const mode = gameMode.toUpperCase()
+  return (
+    [2400, 2410, 2450].includes(queueId) ||
+    mode === "STRAWBERRY" ||
+    mode === "KIWI" ||
+    mode.startsWith("KIWI_")
+  )
 }
 
 function errorMessage(error: unknown) {
@@ -367,7 +411,11 @@ async function copyImage() {
 </script>
 
 <template>
-  <section class="overview-panel" ref="captureRef">
+  <section
+    class="overview-panel"
+    :class="{ 'panel-compact': compactColumns }"
+    ref="captureRef"
+  >
     <header class="overview-toolbar">
       <div class="overview-meta">
         <strong>总览</strong>
@@ -375,7 +423,7 @@ async function copyImage() {
         <span>对局时间 {{ Math.floor(game.gameDuration / 60) }}:{{ String(game.gameDuration % 60).padStart(2, "0") }}</span>
         <span>开始时间 {{ formatDate(game.gameCreation) }}</span>
       </div>
-      <div class="overview-actions">
+      <div class="overview-actions" v-if="!hideActions">
         <button class="ability-toggle" :disabled="loading || !matchDetail" @click="togglePlayerAbility">
           <LoaderCircle v-if="showPlayerAbility && abilityLoading" class="spin" :size="14" />
           <Eye v-else-if="!showPlayerAbility" :size="14" />
@@ -396,26 +444,30 @@ async function copyImage() {
     <div class="overview-state error" v-else-if="error">{{ error }}</div>
 
     <div class="overview-body" v-else-if="matchDetail">
-      <section v-for="team in matchDetail.teams" :key="team.teamId" class="team-block">
+      <section
+        v-for="team in visibleTeams"
+        :key="team.teamId"
+        class="team-block"
+      >
         <div class="team-header" :class="{ win: team.win, lose: !team.win }">
           <div class="team-result">
             <strong>{{ team.name }}</strong>
             <span>{{ team.win ? "胜利" : "失败" }}</span>
           </div>
-          <div class="team-summary">
-            <span>队伍总经济 <b>{{ kNumber(teamSummary(team).goldEarned) }}</b></span>
-            <span>队伍总伤害 <b>{{ kNumber(teamSummary(team).damageToChampions) }}</b></span>
-            <span>队伍总推塔数 <b>{{ teamSummary(team).towerKills }}</b></span>
-          </div>
           <strong class="team-kda-summary">
             {{ teamSummary(team).kills }}/{{ teamSummary(team).deaths }}/{{ teamSummary(team).assists }}
           </strong>
           <span>伤害</span>
-          <span>经济</span>
-          <span>承伤</span>
-          <span>治疗</span>
-          <span>伤转</span>
-          <span>评分</span>
+          <div class="team-summary" v-if="!compactColumns">
+            <span>队伍总经济 <b>{{ kNumber(teamSummary(team).goldEarned) }}</b></span>
+            <span>队伍总伤害 <b>{{ fullNumber(teamSummary(team).damageToChampions) }}</b></span>
+            <span>队伍总推塔数 <b>{{ teamSummary(team).towerKills }}</b></span>
+          </div>
+          <span v-if="!compactColumns">经济</span>
+          <span v-if="!compactColumns">承伤</span>
+          <span v-if="!compactColumns">治疗</span>
+          <span v-if="!compactColumns">伤转</span>
+          <span v-if="!compactColumns">评分</span>
         </div>
 
         <div class="detail-list">
@@ -423,7 +475,7 @@ async function copyImage() {
             v-for="player in team.players"
             :key="`${player.teamId}:${player.participantId}`"
             class="detail-row"
-            :class="{ win: player.win, lose: !player.win }"
+            :class="{ win: player.win, lose: !player.win, owner: isOwnerPlayer(player) }"
             :title="showPlayerAbility ? playerAbilityTitle(player) : playerLabel(player)"
             tabindex="0"
             @click="emit('openPlayer', player)"
@@ -432,11 +484,10 @@ async function copyImage() {
           >
             <div class="champion-cell">
               <ChampionAvatar :champion-id="player.championId" :champions="champions" :size="42" />
-              <span
-                v-if="!showPlayerAbility"
-              >
-                {{ playerLabel(player) }}
-              </span>
+              <div v-if="!showPlayerAbility" class="player-name-cell">
+                <span class="player-name">{{ playerLabel(player) }}</span>
+                <strong v-if="isOwnerPlayer(player)" class="owner-badge">当前账号</strong>
+              </div>
               <span v-else :class="['player-ability-cell', playerAbilityTone(player)]">
                 {{ playerAbilityLabel(player) }}
               </span>
@@ -459,7 +510,20 @@ async function copyImage() {
               />
             </div>
 
-            <div class="item-grid">
+            <div class="kda-cell">
+              <strong>{{ player.kills }}/{{ player.deaths }}/{{ player.assists }}</strong>
+            </div>
+
+            <div class="stat-cell">
+              <strong :class="{ leader: detailStatLeader(player, 'damage') }">
+                {{ fullNumber(player.damageToChampions) }}<em class="damage-sub">
+                  <span>{{ shareSuffix(player.damageToChampions, player.teamDamageToChampions) }}</span>
+                  <b class="bull-chip" :class="`bull-${bullOf(player).tier}`" :title="bullTitle(player)">{{ bullOf(player).label }}</b>
+                </em>
+              </strong>
+            </div>
+
+            <div class="item-grid" v-if="!compactColumns">
               <AssetIcon
                 v-for="itemId in player.itemIds"
                 :key="itemId"
@@ -470,7 +534,7 @@ async function copyImage() {
               />
             </div>
 
-            <div class="rune-grid text-grid" v-if="player.augmentIds.length">
+            <div class="rune-grid text-grid" v-if="!compactColumns && player.augmentIds.length">
               <span
                 v-for="augmentId in player.augmentIds.slice(0, 4)"
                 :key="augmentId"
@@ -479,7 +543,7 @@ async function copyImage() {
                 {{ shortAugmentName(augmentId) }}
               </span>
             </div>
-            <div class="rune-grid" v-else>
+            <div class="rune-grid" v-else-if="!compactColumns">
               <AssetIcon
                 v-for="perkId in player.perkIds.slice(0, 4)"
                 :key="perkId"
@@ -490,41 +554,32 @@ async function copyImage() {
               />
             </div>
 
-            <div class="kda-cell">
-              <strong>{{ player.kills }}/{{ player.deaths }}/{{ player.assists }}</strong>
-            </div>
-
-            <div class="stat-cell">
-              <strong :class="{ leader: detailStatLeader(player, 'damage') }">
-                {{ kNumber(player.damageToChampions) }}<em>{{ shareSuffix(player.damageToChampions, player.teamDamageToChampions) }}</em>
-              </strong>
-            </div>
-
-            <div class="stat-cell">
+            <div class="stat-cell" v-if="!compactColumns">
               <strong :class="{ leader: detailStatLeader(player, 'gold') }">
                 {{ kNumber(player.goldEarned) }}<em>{{ shareSuffix(player.goldEarned, player.teamGoldEarned) }}</em>
               </strong>
             </div>
 
-            <div class="stat-cell">
+            <div class="stat-cell" v-if="!compactColumns">
               <strong :class="{ leader: detailStatLeader(player, 'mitigation') }">
                 {{ kNumber(mitigationValue(player)) }}<em>{{ shareSuffix(mitigationValue(player), teamMitigationValue(player)) }}</em>
               </strong>
             </div>
 
-            <div class="stat-cell">
+            <div class="stat-cell" v-if="!compactColumns">
               <strong :class="{ leader: detailStatLeader(player, 'healing') }">
                 {{ kNumber(player.totalHeal) }}<em>{{ shareSuffix(player.totalHeal, player.teamTotalHeal) }}</em>
               </strong>
             </div>
 
-            <div class="stat-cell">
+            <div class="stat-cell" v-if="!compactColumns">
               <strong :class="{ leader: detailStatLeader(player, 'conversion') }">
                 {{ damageConversion(player) }}
               </strong>
             </div>
 
             <div
+              v-if="!compactColumns"
               :class="['score-cell', `score-${outputRating(player).level}`]"
             :title="outputRatingHint(player)"
           >
@@ -638,10 +693,16 @@ async function copyImage() {
 .team-header,
 .detail-row {
   display: grid;
-  grid-template-columns: 160px 22px 252px 160px 59px repeat(5, 62px) 128px;
-  min-width: 1131px;
+  grid-template-columns: 160px 22px 59px 96px 252px 160px repeat(4, 62px) 128px;
+  min-width: 1161px;
   align-items: center;
   gap: 4px;
+}
+
+.panel-compact .team-header,
+.panel-compact .detail-row {
+  grid-template-columns: 160px 22px 59px 96px;
+  min-width: 0;
 }
 
 .team-header {
@@ -662,6 +723,7 @@ async function copyImage() {
 
 .team-result {
   display: flex;
+  grid-column: span 2;
   min-width: 0;
   align-items: center;
   gap: 6px;
@@ -683,7 +745,7 @@ async function copyImage() {
 .team-summary {
   display: grid;
   min-width: 0;
-  grid-column: span 3;
+  grid-column: span 2;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   align-items: center;
   gap: 4px;
@@ -707,6 +769,7 @@ async function copyImage() {
 }
 
 .team-kda-summary {
+  grid-column: 3;
   text-align: center;
 }
 
@@ -734,6 +797,24 @@ async function copyImage() {
   filter: saturate(1.04) brightness(0.99);
 }
 
+.detail-row.owner {
+  position: relative;
+  border-width: 2px;
+  border-left-width: 6px;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.4),
+    0 0 0 2px rgba(255, 195, 64, 0.22);
+}
+
+.detail-row.owner::after {
+  position: absolute;
+  inset: 0;
+  border-radius: 6px;
+  box-shadow: inset 0 0 0 1px rgba(255, 215, 106, 0.55);
+  content: "";
+  pointer-events: none;
+}
+
 .detail-row.win {
   border-color: #c9ddf8;
   border-left-color: #2f78d6;
@@ -753,12 +834,41 @@ async function copyImage() {
   gap: 6px;
 }
 
-.champion-cell span {
+.player-name-cell {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.champion-cell span,
+.player-name {
   min-width: 0;
   overflow: hidden;
   color: #53666c;
   font-size: 13.5px;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-row.owner .player-name {
+  color: #7a4300;
+  font-weight: 900;
+}
+
+.owner-badge {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  border: 1px solid rgba(214, 147, 36, 0.52);
+  border-radius: 999px;
+  color: #7a4300;
+  background: linear-gradient(135deg, rgba(255, 247, 205, 0.96), rgba(255, 222, 122, 0.95));
+  font-size: 10px;
+  font-weight: 950;
+  line-height: 1;
+  padding: 3px 7px;
   white-space: nowrap;
 }
 
@@ -882,6 +992,37 @@ async function copyImage() {
   font-size: 13.5px;
   font-style: normal;
   font-weight: 700;
+}
+
+.stat-cell em.damage-sub {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.bull-chip {
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 900;
+  font-style: normal;
+  line-height: 1;
+  padding: 2px 4px;
+  white-space: nowrap;
+}
+
+.bull-chip.bull-bull {
+  color: #5d3300;
+  background: linear-gradient(135deg, #ffe08a, #ffb03a);
+}
+
+.bull-chip.bull {
+  color: #145b3e;
+  background: #d9f1e1;
+}
+
+.bull-chip.bull-none {
+  color: #7a4323;
+  background: #f3e3d2;
 }
 
 .score-cell {

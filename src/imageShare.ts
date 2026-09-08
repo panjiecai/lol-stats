@@ -22,6 +22,27 @@ export async function copyElementAsPng(
   if (!blob) throw new Error("图片生成失败")
 
   await writeImageBlobToClipboard(blob)
+
+  return readImageSize(blob)
+}
+
+async function readImageSize(blob: Blob) {
+  try {
+    const url = URL.createObjectURL(blob)
+    const img = new Image()
+    await new Promise((resolve, reject) => {
+      img.onload = resolve
+      img.onerror = reject
+      img.src = url
+    })
+    URL.revokeObjectURL(url)
+    return {
+      width: img.naturalWidth,
+      height: img.naturalHeight,
+    }
+  } catch {
+    return null
+  }
 }
 
 async function writeImageBlobToClipboard(blob: Blob) {

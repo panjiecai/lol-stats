@@ -253,6 +253,40 @@ export interface PlayerEloEstimateGameSample {
   soloPlayers: PlayerEloEstimateParticipant[]
 }
 
+export interface PlayerEloScanGame {
+  gameId: number
+  gameCreation: number
+  queueId: number
+  gameMode: string
+  championId: number
+  isSoloGame: boolean
+  note: string
+}
+
+export interface PlayerEloTraceParticipant {
+  puuid: string
+  summonerName: string
+  gameName: string
+  tagLine: string
+  championId: number
+  side: string
+  included: boolean
+  elo: number | null
+  note: string
+}
+
+export interface PlayerEloGameLog {
+  gameId: number
+  gameCreation: number
+  queueId: number
+  gameMode: string
+  championId: number
+  included: boolean
+  maxElo: number | null
+  note: string
+  players: PlayerEloTraceParticipant[]
+}
+
 export interface PlayerEloEstimateResponse {
   sampleTarget: number
   sampleGames: number
@@ -263,14 +297,82 @@ export interface PlayerEloEstimateResponse {
   rawGameMaxElos: number[]
   trimmedGameMaxElos: number[]
   gameSamples: PlayerEloEstimateGameSample[]
+  scanGames: PlayerEloScanGame[]
+  gameLogs: PlayerEloGameLog[]
 }
 
 export interface PlayerEloEstimateTaskStatus {
   jobId: string
   status: string
+  message: string
+  nextPollDelayMs: number
   cached: boolean
   result: PlayerEloEstimateResponse | null
   error: string | null
+}
+
+export interface PlayerEloQueueItem {
+  jobId: string
+  displayName: string
+  riotId: string
+  sgpServerId: string
+  status: string
+  message: string
+  nextPollDelayMs: number
+  updatedAtMs: number
+  currentElo: number | null
+  sampleGames: number
+}
+
+export interface PlayerEloQueueSnapshot {
+  activeItems: PlayerEloQueueItem[]
+  historyItems: PlayerEloQueueItem[]
+}
+
+export interface ExternalEloLookupDebugResponse {
+  riotId: string
+  normalizedRiotId: string
+  sgpServerId: string
+  areaId: number
+  areaName: string
+  matchedRiotId: string
+  openId: string
+  infoRequestUrl: string
+  rankRequestUrl: string
+  infoPayload: string
+  rankPayload: string
+  infoCode: number
+  rankCode: number
+  extractedRankText: string
+  elo: number | null
+  usedPowershell: boolean
+  note: string
+}
+
+export interface OfficialApiProbeSample {
+  gameId: number
+  queueId: number
+  gameMode: string
+  gameCreation: number
+  championId: number
+  summaryRequestUrl: string
+  summaryPayload: string
+  rankLikePaths: string[]
+  firstParticipantChallengeHits: string[]
+}
+
+export interface OfficialApiDebugResponse {
+  sgpServerId: string
+  baseUrl: string
+  summoner: SummonerInfo
+  rankedRequestUrl: string
+  rankedPayload: string
+  rankedLikePaths: string[]
+  matchHistoryRequestUrl: string
+  matchHistoryPayload: string
+  matchHistoryLikePaths: string[]
+  sampleGames: OfficialApiProbeSample[]
+  note: string
 }
 
 export interface LivePlayer {
@@ -309,6 +411,31 @@ export interface LiveGameResponse {
   queueType?: string
   gameMode?: string
   teams: LiveTeam[]
+}
+
+export interface ActiveGamePlayer {
+  puuid: string
+  summonerName: string
+  championId: number
+  spell1Id: number
+  spell2Id: number
+  profileIconId: number
+  position: string
+}
+
+export interface ActiveGameTeam {
+  name: string
+  players: ActiveGamePlayer[]
+}
+
+export interface PlayerActiveGame {
+  inGame: boolean
+  gameId?: number
+  queueConfigId?: number
+  queueTypeName?: string
+  gameMode?: string
+  gameState?: string
+  teams: ActiveGameTeam[]
 }
 
 export interface ChampionSummaryItem {
