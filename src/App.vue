@@ -355,9 +355,6 @@ const liveAramkitChampionId = computed(() => {
   return championId > 0 && championMap.value[championId] ? championId : null
 })
 
-const currentPuuid = computed(
-  () => status.value?.summoner?.puuid || currentRecentStats.value?.summoner?.puuid || "",
-)
 const searchPuuid = computed(
   () =>
     searchRecentStats.value?.summoner?.puuid || searchFullStats.value?.summoner?.puuid || "",
@@ -2084,12 +2081,6 @@ onUnmounted(() => {
       </section>
 
       <section class="current-page" v-show="activePage === 'current'">
-        <ActiveGamePanel
-          v-if="currentPuuid"
-          :puuid="currentPuuid"
-          :champions="championMap"
-          :game-assets="gameAssets"
-        />
         <RecordView
           :recent-stats="currentRecentStats"
           :full-stats="currentFullStats"
