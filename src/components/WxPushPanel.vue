@@ -82,28 +82,46 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
 
-async function connectService() {
+/**
+ * 服务由应用主进程随启动拉起，冷启动时要解密微信本地库，
+ * 头几秒探活必然失败，所以自动连接要带重试。
+ */
+async function connectService(options: { silent?: boolean; retries?: number } = {}) {
   if (connecting.value) return
   setWxPushUrl(urlDraft.value.trim() || defaultUrl)
   connecting.value = true
+  const retries = options.retries ?? 0
   try {
-    const health = await probeWxPush()
+    let health: Awaited<ReturnType<typeof probeWxPush>> | null = null
+    let lastError: unknown = null
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        health = await probeWxPush()
+        break
+      } catch (error) {
+        lastError = error
+        if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, 600))
+      }
+    }
+    if (!health) throw lastError
     serviceOnline.value = health.ok
     whitelist.value = health.chats
     whitelistDraft.value = health.chats.map((item) => ({ ...item }))
-    notify({
-      kind: "success",
-      title: "微信服务在线",
-      message: `已配置 ${health.chats.length} 个可发送目标`,
-      duration: 6000,
-    })
+    if (!options.silent) {
+      notify({
+        kind: "success",
+        title: "微信服务在线",
+        message: `已配置 ${health.chats.length} 个可发送目标`,
+        duration: 6000,
+      })
+    }
     void loadCandidates()
   } catch (error) {
     serviceOnline.value = false
     notify({
       kind: "error",
       title: "连不上微信服务",
-      message: `${errorMessage(error)}；先运行 start-wx-server.py`,
+      message: `${errorMessage(error)}；服务随应用启动，可能还在初始化，稍后点「连接服务」重试`,
       duration: 9000,
     })
   } finally {
@@ -239,7 +257,7 @@ async function sendTestCard() {
 }
 
 onMounted(() => {
-  if (wxPushUrl.value.trim()) void connectService()
+  if (wxPushUrl.value.trim()) void connectService({ silent: true, retries: 8 })
 })
 </script>
 
@@ -258,7 +276,7 @@ onMounted(() => {
 
     <p class="wx-note">
       截图后由本机服务在后台直接发到微信群：不占剪贴板、不抢前台窗口。
-      需要先运行 <code>start-wx-server.py</code>。
+      服务随应用自动启动，关闭应用即停止。
     </p>
 
     <div class="wx-row">
@@ -276,7 +294,7 @@ onMounted(() => {
         <input type="checkbox" :checked="wxPushEnabled" @change="onEnabledChange" />
         <span>启用推送</span>
       </label>
-      <button class="wx-btn" :disabled="connecting" @click="connectService">
+      <button class="wx-btn" :disabled="connecting" @click="connectService()">
         <LoaderCircle v-if="connecting" :size="14" class="spin" />
         <RefreshCw v-else :size="14" />
         {{ connecting ? "连接中" : "连接服务" }}
