@@ -1,0 +1,12 @@
+{
+  "account": "wxid_xxxxxxxxxxxxxxxx_xxxxxx",
+  "selfId": "wxid_xxxxxxxxxxxxxxxx",
+  "dbDir": "D:/Documents/weixin/xwechat_files",
+  "moduleFile": "",
+  "pageSize": 50,
+  "pollSeconds": 2,
+  "mediaRoots": ["C:/path/to/lol-stats/screenshots"],
+  "chats": [
+    { "id": "filehelper", "name": "文件传输助手" }
+  ]
+}

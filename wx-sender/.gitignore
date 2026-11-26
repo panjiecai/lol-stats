@@ -1,0 +1,22 @@
+# 构建产物与运行期数据
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 打包输出
+dist/
+build/
+*.spec
+
+# 本机配置与状态（含微信账号信息，绝不提交）
+config.json
+state/
+engine/current.json
+engine/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/
+
+# 原生桥编译产物（与微信版本绑定，必须本机编译）
+*.dll
+*.lib
+*.exp
+*.obj
