@@ -159,6 +159,7 @@ const WINDOW_STARTUP_SIZE_KEY = "lol-stats.window-startup-size"
 const LIVE_CARD_EXTRA_HEIGHT_KEY = "lol-stats.live-card-extra-height"
 const RELEASE_NOTES_SEEN_VERSION_KEY = "lol-stats.release-notes.seen-version"
 const RELEASE_NOTES_DISABLED_KEY = "lol-stats.release-notes.disabled"
+const UPDATE_NOTICE_SEEN_VERSION_KEY = "lol-stats.update-notice.seen-version"
 const MIN_PROGRESS_VISIBLE_MS = 700
 const HIDDEN_DRILL_CACHE_MS = 10 * 60 * 1000
 const HIDDEN_DRILL_CACHE_LIMIT = 20
@@ -191,6 +192,7 @@ const LOCAL_RELEASE_NOTES: Record<string, string[]> = {
     "新增微信推送本地服务：截图后由本机服务在后台直接发到微信群，不占剪贴板、不抢前台窗口，可以边玩边发。",
     "监控面板内置微信推送配置：自动列出本机所有聊天，勾选目标群后保存白名单，服务端只允许发往白名单内的群。",
     "推送前可选附带文字，未勾选任何目标时保持原来的「复制到剪贴板」行为不变。",
+    "合并上游 fork：牛气排行榜、监控面板、截图导出与影刀推送，以及 SGP 的 PBE 双域名支持。",
   ],
   "0.7.2": [
     "修复「轮询新战绩」偶尔有新对局却不执行的问题：改用自循环调度，加入卡死看门狗与回到前台自动补偿，导出失败也不再丢帧。",
@@ -738,6 +740,12 @@ async function checkForAppUpdate() {
     if (!update.hasUpdate) return
 
     if (!appCurrentVersion.value) appCurrentVersion.value = update.currentVersion
+
+    // 同一个新版本提示只弹一次，之后启动不再反复打扰；
+    // 出现更新的版本时（latestVersion 变化）会再提示一次。
+    if (localStorage.getItem(UPDATE_NOTICE_SEEN_VERSION_KEY) === update.latestVersion) return
+    localStorage.setItem(UPDATE_NOTICE_SEEN_VERSION_KEY, update.latestVersion)
+
     showAppUpdateDialog(update)
   } catch {
     // 更新提示不能影响主流程；网络失败或更新源不可达时静默跳过。

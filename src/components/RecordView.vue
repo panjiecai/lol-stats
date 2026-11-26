@@ -65,6 +65,7 @@ const statsDateStart = ref("")
 const statsDateEnd = ref("")
 const statsDatePickerOpen = ref(false)
 const soloOnly = ref(false)
+const includeArenaTournament = ref(true)
 let statsDepthCloseTimer = 0
 let statsDateCloseTimer = 0
 
@@ -76,6 +77,8 @@ const statsDepthOptions = STATS_DEPTH_OPTIONS
 function isHexAramGame(game: RecentGame) {
   const queueId = game.queueId
   const mode = (game.gameMode || "").toUpperCase()
+  // 海斗大赛（2410）可勾选排除；2400/2450 为海克斯大乱斗本体。
+  if (!includeArenaTournament.value && queueId === 2410) return false
   return (
     [2400, 2410, 2450].includes(queueId) ||
     mode === "STRAWBERRY" ||
@@ -175,6 +178,7 @@ watch(
   [
     () => selectedQueue.value,
     () => soloOnly.value,
+    () => includeArenaTournament.value,
     () => statsDateStart.value,
     () => statsDateEnd.value,
     () => props.fullStats?.depthRequested ?? 0,
@@ -534,6 +538,10 @@ function round2(value: number) {
             {{ option.label }}
           </button>
           <div class="queue-tools">
+            <label class="stats-toggle" v-if="selectedQueue === 'arena'">
+              <input v-model="includeArenaTournament" type="checkbox" />
+              <span>含海斗大赛</span>
+            </label>
             <label class="stats-toggle">
               <input v-model="soloOnly" type="checkbox" />
               <span>单人开局</span>

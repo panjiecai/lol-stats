@@ -17,14 +17,20 @@ const USER_AGENT: &str = "LeagueOfLegendsClient/14.13.596.7996 (rcp-be-lol-match
 const MAX_RETRIES: usize = 3;
 const OFFICIAL_PROBE_SAMPLE_COUNT: usize = 3;
 
-/// 国服 SGP（Service Gateway Proxy）深战绩客户端。
+/// SGP（Service Gateway Proxy）深战绩客户端（国服 / PBE）。
 ///
 /// LCU 的 `/lol-match-history/v1/products/lol/{puuid}/matches` 在部分国服客户端上会忽略
 /// `begIndex/endIndex`，只能稳定拿到第一页。Akari 的深分页走 SGP，这里只实现统计需要的
 /// SUMMARY 接口，并把返回值映射成项目内部已有的 `Game` 结构。
 pub struct SgpClient {
     http: Client,
+    /// 深战绩（match-history-query）所在 host。
     base_url: String,
+    /// 段位/召唤师（leagues-ledge / summoner-ledge）所在 host。
+    /// 国服与深战绩同域；PBE 走独立的 `-red` 域名。
+    red_base_url: String,
+    /// 平台号（HN1 / PBE1 …），用于 summoner-ledge 与对局详情路径。
+    platform_id: String,
     /// 留一份 LCU 客户端：长爬取中途 token 会过期，遇到 401 时用它重拉一次，
     /// 免得整段爬取因为一个过期 token 提前失去命中率。
     lcu: LcuClient,
@@ -49,7 +55,7 @@ impl SgpClient {
         sgp_server_id: Option<&str>,
     ) -> AppResult<Self> {
         let sgp_server_id = resolve_sgp_server_id(auth, sgp_server_id);
-        let base_url = tencent_sgp_base_url(&sgp_server_id)?;
+        let endpoints = resolve_sgp_endpoints(&sgp_server_id)?;
         let access_token = lcu.entitlements_access_token().await?;
         let league_session_token = lcu
             .league_session_token()
@@ -74,7 +80,9 @@ impl SgpClient {
 
         Ok(Self {
             http,
-            base_url: base_url.to_string(),
+            base_url: endpoints.match_base_url.to_string(),
+            red_base_url: endpoints.red_base_url.to_string(),
+            platform_id: endpoints.platform_id,
             lcu: lcu.clone(),
             tokens: std::sync::RwLock::new(SgpTokens {
                 access_token,
@@ -163,7 +171,7 @@ impl SgpClient {
             .http
             .get(format!(
                 "{}/leagues-ledge/v2/rankedStats/puuid/{}",
-                self.base_url, puuid
+                self.red_base_url, puuid
             ))
             .header(
                 "Authorization",
@@ -194,17 +202,19 @@ impl SgpClient {
             return Ok(Vec::new());
         }
 
-        let sub_id = self
-            .sgp_server_id
-            .strip_prefix("TENCENT_")
-            .unwrap_or(&self.sgp_server_id)
-            .to_ascii_lowercase();
+        // 国服 summoner-ledge 路径历史上一律用小写平台号；PBE 客户端实际使用大写
+        // （`.../regions/PBE1/...`）。两者互不影响。
+        let sub_id = if self.sgp_server_id.starts_with("TENCENT_") {
+            self.platform_id.to_ascii_lowercase()
+        } else {
+            self.platform_id.to_ascii_uppercase()
+        };
 
         let response = self
             .http
             .post(format!(
                 "{}/summoner-ledge/v1/regions/{}/summoners/puuids",
-                self.base_url, sub_id
+                self.red_base_url, sub_id
             ))
             .header(
                 "Authorization",
@@ -289,11 +299,7 @@ impl SgpClient {
     }
 
     pub async fn game_summary(&self, game_id: u64) -> AppResult<Game> {
-        let sub_id = self
-            .sgp_server_id
-            .strip_prefix("TENCENT_")
-            .unwrap_or(&self.sgp_server_id)
-            .to_ascii_uppercase();
+        let sub_id = self.platform_id.to_ascii_uppercase();
 
         let response = self
             .get_authed(
@@ -369,15 +375,11 @@ pub async fn debug_official_api_probe(
 ) -> AppResult<OfficialApiDebugResponse> {
     let summoner = lcu.current_summoner().await?;
     let sgp = SgpClient::new(lcu, auth, sgp_server_id).await?;
-    let sub_id = sgp
-        .sgp_server_id
-        .strip_prefix("TENCENT_")
-        .unwrap_or(&sgp.sgp_server_id)
-        .to_ascii_uppercase();
+    let sub_id = sgp.platform_id.to_ascii_uppercase();
 
     let ranked_request_url = format!(
         "{}/leagues-ledge/v2/rankedStats/puuid/{}",
-        sgp.base_url, summoner.puuid
+        sgp.red_base_url, summoner.puuid
     );
     let ranked_payload = sgp
         .http
@@ -1155,6 +1157,43 @@ fn collect_first_participant_challenge_hits(text: &str) -> Vec<String> {
     hits
 }
 
+/// 解析某个区服对应的 SGP 端点。
+///
+/// 国服（`TENCENT_*`）沿用原有域名：深战绩与段位/召唤师同域。
+/// PBE 走 Riot 自己的 `*.sgp.pvp.net`：深战绩在 `pbe.pp.*`，段位/召唤师在
+/// `pbe-red.lol.*`，两者是不同 host；平台号固定为 `PBE1`（PBE 客户端命令行不带
+/// `--rso_platform_id`，无法像国服那样从参数推导）。
+struct SgpEndpoints {
+    match_base_url: &'static str,
+    red_base_url: &'static str,
+    platform_id: String,
+}
+
+fn resolve_sgp_endpoints(sgp_server_id: &str) -> AppResult<SgpEndpoints> {
+    if sgp_server_id.starts_with("TENCENT_") {
+        let base_url = tencent_sgp_base_url(sgp_server_id)?;
+        return Ok(SgpEndpoints {
+            match_base_url: base_url,
+            red_base_url: base_url,
+            platform_id: sgp_server_id
+                .strip_prefix("TENCENT_")
+                .unwrap_or(sgp_server_id)
+                .to_string(),
+        });
+    }
+
+    match sgp_server_id {
+        "PBE" => Ok(SgpEndpoints {
+            match_base_url: "https://pbe.pp.sgp.pvp.net",
+            red_base_url: "https://pbe-red.lol.sgp.pvp.net",
+            platform_id: "PBE1".to_string(),
+        }),
+        other => Err(AppError::SgpUnavailable(format!(
+            "暂未配置大区 {other} 的 SGP 深战绩地址"
+        ))),
+    }
+}
+
 fn tencent_sgp_base_url(sgp_server_id: &str) -> AppResult<&'static str> {
     let Some(rso_platform_id) = sgp_server_id.strip_prefix("TENCENT_") else {
         return Err(AppError::SgpUnavailable(
@@ -1525,11 +1564,7 @@ mod tests {
             .await
             .expect("应能读取最近对局");
         let game = history.first().expect("最近对局至少应有 1 局");
-        let sub_id = sgp
-            .sgp_server_id
-            .strip_prefix("TENCENT_")
-            .unwrap_or(&sgp.sgp_server_id)
-            .to_ascii_uppercase();
+        let sub_id = sgp.platform_id.to_ascii_uppercase();
 
         let summary_text = sgp
             .http

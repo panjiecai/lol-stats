@@ -16,6 +16,7 @@ export const searchServerOptions: SearchServerOption[] = [
   { id: "TENCENT_BGP2", label: "峡谷之巅" },
   { id: "TENCENT_PBE", label: "体验服" },
   { id: "TENCENT_PREPBE", label: "PREPBE" },
+  { id: "PBE", label: "PBE（官方测试服）" },
 ]
 
 export function isKnownSearchServer(sgpServerId: string) {
