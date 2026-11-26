@@ -145,9 +145,15 @@ LOL Stats 使用 Tauri 2、Rust 和 Vue 3 开发，主要解决两件事：
 ```text
 lol-stats
 ├─ docs
-│  └─ scoring-system.md          # 当前评分系统完整说明
+│  ├─ scoring-system.md          # 当前评分系统完整说明
+│  └─ wechat-push.md             # 微信推送服务的现状、缺陷与风险
 ├─ scripts
 │  └─ publish-release.ps1        # GitHub / Gitee Release 自动发布
+├─ wx-sender                     # 微信推送本地服务（独立运行）
+│  ├─ wx_server.py               # HTTP 服务，127.0.0.1:8756
+│  ├─ wx_send_core.py            # 发送核心，服务与 CLI 共用
+│  ├─ engine/                    # 原生桥源码与微信版本适配表
+│  └─ 换机校对清单.md            # 换机部署的完整检查步骤
 ├─ src
 │  ├─ api.ts                     # Tauri 命令调用封装
 │  ├─ assetLoader.ts             # LCU 图片资源批量加载与内存缓存
@@ -213,6 +219,14 @@ lol-stats
 3. 等待当前角色和客户端资源加载完成。
 
 软件不会要求管理员权限。如果客户端未启动、未登录或国服 SGP 暂时不可用，界面会显示经过简化的错误提示。
+
+### 微信推送（可选）
+
+监控面板支持「对局结束自动把战绩图发到微信群」，由 `wx-sender` 目录下的本地服务实现，**不占剪贴板、不抢前台窗口**，可以边玩边发。
+
+该功能有严格的前置条件：微信版本必须命中适配表、原生桥必须在本机编译。详见 [docs/wechat-push.md](./docs/wechat-push.md)。
+
+> ⚠️ 这是逆向实现（读本地数据库 + 注入 DLL），不是官方接口，存在账号受限风险，建议只用小号。
 
 ## 开发运行
 
@@ -454,5 +468,7 @@ GitHub 和 Gitee 都支持标准 Markdown 图片语法：
 战绩核心功能读取本机客户端提供的 LCU / Riot Client 接口和国服战绩接口。自动接受对局、聊天状态、聊天签名和退出结算等快捷工具只会在用户明确启用或点击后调用本机客户端接口；游戏设置锁定只处理本地设置文件。项目不会注入游戏进程，也不会修改服务器上的对局数据。
 
 英雄联盟名称、商标、英雄形象、装备图标、海克斯强化图标及其他游戏素材的相关权利归 Riot Games、腾讯游戏或对应权利方所有。MIT License 仅适用于本项目自行编写的源代码，不代表对第三方素材进行再授权。
+
+`wx-sender/engine` 下的微信原生桥来自 [Prometheus-first/helper](https://github.com/Prometheus-first/helper)，适用其**非商业使用许可协议**，不受本项目 MIT 许可覆盖。详见 `wx-sender/engine/LICENSE` 与 `wx-sender/engine/NOTICE.md`。分发或商用前请先阅读该协议。
 
 工具页中的 AramKit 为第三方网页，其页面、数据和内容归原网站或对应权利方所有，本项目不对第三方服务的可用性、准确性和内容负责。请自行承担使用第三方工具与非官方接口的风险，并避免高频请求对客户端或服务造成压力。
