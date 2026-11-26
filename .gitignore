@@ -32,3 +32,10 @@ gen/schemas
 
 # local diagnostic scratch
 inspect_queues.py
+
+# wx-sender 运行期按账号落盘的解密数据（含微信库密钥，绝不提交）
+wx-sender/wxid_*/
+
+# 推送截图与本地工作记录
+screenshots/
+.workbuddy/

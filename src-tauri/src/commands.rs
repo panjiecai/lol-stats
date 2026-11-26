@@ -741,6 +741,18 @@ pub fn app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// 微信推送服务的托管状态（是否由本应用拉起、PID、目录、是否在线）。
+#[tauri::command]
+pub fn wx_service_status() -> serde_json::Value {
+    crate::wx_service::status()
+}
+
+/// 重启微信推送服务。微信重新登录后句柄失效，必须重启才能继续发送。
+#[tauri::command]
+pub fn restart_wx_service() -> Result<serde_json::Value, String> {
+    crate::wx_service::restart()
+}
+
 #[tauri::command]
 pub async fn accept_ready_check() -> Result<(), String> {
     let clients = create_clients().map_err(app_error)?;

@@ -1,12 +1,15 @@
 mod commands;
 mod services;
+mod wx_service;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|_| {
             commands::initialize_player_elo_jobs();
+            // 微信推送服务跟着应用一起起，退出时由 RunEvent::Exit 回收
+            wx_service::start();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -45,8 +48,18 @@ pub fn run() {
             commands::set_chat_availability,
             commands::set_chat_status_message,
             commands::set_game_settings_locked,
-            commands::send_alt_left_shortcut
+            commands::send_alt_left_shortcut,
+            commands::wx_service_status,
+            commands::restart_wx_service
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|_handle, event| {
+        // 正常退出时显式回收；即便走到这里之前进程被杀，
+        // Job Object 的 KILL_ON_JOB_CLOSE 也会兜住。
+        if matches!(event, tauri::RunEvent::Exit) {
+            wx_service::stop();
+        }
+    });
 }
