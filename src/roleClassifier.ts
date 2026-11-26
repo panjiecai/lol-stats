@@ -330,10 +330,15 @@ function itemRoleVector(game: RecentGame, items: Record<number, GameAssetEntry> 
   return { vector: normalizeVector(vector), itemGold }
 }
 
-function combineRoles(itemWeights: RoleVector, championWeights: RoleVector, itemGold: number) {
+function combineRoles(
+  itemWeights: RoleVector,
+  championWeights: RoleVector,
+  itemGold: number,
+  maxItemRatio = 0.78,
+) {
   const itemDominance = Math.max(...Object.values(itemWeights))
   const hasItemEvidence = vectorTotal(itemWeights) > 0
-  const itemRatio = (() => {
+  const rawItemRatio = (() => {
     if (!hasItemEvidence) return 0
 
     if (itemGold >= 4500) {
@@ -348,6 +353,8 @@ function combineRoles(itemWeights: RoleVector, championWeights: RoleVector, item
 
     return itemDominance >= 0.85 ? 0.55 : 0.4
   })()
+  // 定位以英雄本身为主，装备只在允许的范围内修正。
+  const itemRatio = Math.min(rawItemRatio, maxItemRatio)
   const championRatio = 1 - itemRatio
   const finalWeights = cloneVector()
 
@@ -385,6 +392,61 @@ function championAllowsAdc(championRoles: string[]) {
     .some((role) => role.toLowerCase() === "marksman")
 }
 
+type ChampionArchetype = "meleeDamage" | "meleeTank" | "ranged" | "support" | "unknown"
+
+// 英雄主定位决定定位大方向：近战伤害英雄不会被 AP 装改判成法师，远程英雄才由输出装细分。
+function championArchetype(championRoles: string[]): ChampionArchetype {
+  switch (championRoles[0]?.toLowerCase()) {
+    case "fighter":
+    case "assassin":
+      return "meleeDamage"
+    case "tank":
+      return "meleeTank"
+    case "marksman":
+    case "mage":
+      return "ranged"
+    case "support":
+      return "support"
+    default:
+      return "unknown"
+  }
+}
+
+// 远程英雄的物理输出装统一视为 ADC 装备，避免穿甲/战士装把它判成刺客或战士。
+function mergeAdItemEvidence(vector: RoleVector): RoleVector {
+  const merged = cloneVector()
+  for (const role of Object.keys(EMPTY_VECTOR) as RoleKey[]) {
+    merged[role] = vector[role]
+  }
+  merged.adc += merged.assassin + merged.fighter
+  merged.assassin = 0
+  merged.fighter = 0
+  return normalizeVector(merged)
+}
+
+const SKIRMISHER_ROLES: PlayerRole[] = [
+  "fighter",
+  "assassin",
+  "pureAssassin",
+  "fighterAssassin",
+  "bruiser",
+]
+
+function itemRatioCap(archetype: ChampionArchetype) {
+  switch (archetype) {
+    case "meleeDamage":
+      return 0.26
+    case "meleeTank":
+      return 0.3
+    case "ranged":
+      return 0.62
+    case "support":
+      return 0.45
+    default:
+      return 0.78
+  }
+}
+
 export function roleLabel(role: PlayerRole) {
   return ROLE_LABELS[role]
 }
@@ -402,16 +464,28 @@ export function analyzePlayerRole(game: RecentGame, context: RatingContext = {})
   const champion = context.champions?.[game.championId]
   const championRoles = champion?.roles || []
   const championWeights = championRoleVector(champion)
+  const archetype = championArchetype(championRoles)
   const { vector: rawItemWeights, itemGold } = itemRoleVector(game, context.items)
-  const itemWeights = championAllowsAdc(championRoles)
+  let itemWeights = championAllowsAdc(championRoles)
     ? rawItemWeights
     : removeRole(rawItemWeights, "adc")
+  if (archetype === "meleeDamage" || archetype === "meleeTank") {
+    // 近战英雄出 AP 装仍然是他本人，不因装备改判为法师。
+    itemWeights = removeRole(removeRole(itemWeights, "mage"), "adc")
+  } else if (archetype === "ranged") {
+    itemWeights = mergeAdItemEvidence(itemWeights)
+  }
   const { finalWeights, itemWeightRatio, championWeightRatio } = combineRoles(
     itemWeights,
     championWeights,
     itemGold,
+    itemRatioCap(archetype),
   )
-  const role = resolveRole(finalWeights)
+  let role = resolveRole(finalWeights)
+  if (archetype === "meleeDamage" && !SKIRMISHER_ROLES.includes(role)) {
+    role = resolveRole(championWeights)
+    if (!SKIRMISHER_ROLES.includes(role)) role = "fighter"
+  }
   const confidence = Math.max(...Object.values(finalWeights))
 
   return {

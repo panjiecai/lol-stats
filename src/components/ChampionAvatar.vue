@@ -22,6 +22,8 @@ const fallback = computed(() => (props.championId ? String(props.championId) : "
 const boxStyle = computed(() => ({
   width: `${props.size}px`,
   height: `${props.size}px`,
+  // 头像没加载出来时显示英雄 ID 占位，字号跟着尺寸走，放大后才不会显得空荡
+  "--avatar-placeholder-font": `${Math.max(11, Math.round(props.size * 0.28))}px`,
 }))
 
 watch(
@@ -74,7 +76,7 @@ watch(
   padding: 0 3px;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 11px;
+  font-size: var(--avatar-placeholder-font, 11px);
   font-weight: 800;
 }
 </style>

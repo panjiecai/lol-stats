@@ -10,6 +10,8 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+# 打包时为了绕开 vite emptyDir 清空守卫，会把旧 dist 改名成 dist_stale_<时间戳>
+dist_stale_*
 *.local
 
 # Rust/Tauri output

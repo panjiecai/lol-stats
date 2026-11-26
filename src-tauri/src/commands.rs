@@ -14,7 +14,7 @@ use crate::services::models::{
     ExternalEloLookupDebugResponse, FriendToolEntry, GameAssetBundle, GameflowPlayer,
     GameflowSession, LiveGameResponse, LivePlayer, LivePremadeMarker, LiveTeam,
     MatchDetailResponse, OfficialApiDebugResponse, PersistedPlayerEloTaskRecord,
-    PlayerActiveGame, PlayerEloEstimateResponse, PlayerEloEstimateTaskStatus, PlayerEloQueueItem,
+    PlayerEloEstimateResponse, PlayerEloEstimateTaskStatus, PlayerEloQueueItem,
     PlayerEloQueueSnapshot, PlayerStatsResponse, PlayerSummary, RankedQueueEntry,
     RankedStatsResponse, RecentGame, SafeClientInfo, SummonerInfo, SummonerSearchCandidate,
 };
@@ -22,12 +22,13 @@ use crate::services::sgp::{
     debug_official_api_probe, normalize_sgp_server_id, resolve_sgp_server_id,
 };
 use crate::services::stats::{
-    clear_player_elo_cache as clear_player_elo_cache_service, debug_external_elo_lookup,
-    delete_duplicate_player_elo_jobs as delete_duplicate_player_elo_jobs_service,
+    clear_player_elo_cache as clear_player_elo_cache_service,
+    debug_external_elo_lookup, delete_duplicate_player_elo_jobs as delete_duplicate_player_elo_jobs_service,
     estimate_player_elo, estimate_player_elo_with_progress, load_cached_player_elo,
     load_last_player_elo, load_match_detail as load_match_detail_service, load_player_elo_jobs,
-    load_player_stats, load_player_stats_with_progress, normalize_depth, probe_player_external_elo,
-    prune_player_elo_job_history, read_player_elo_job, write_player_elo_job,
+    load_player_stats, load_player_stats_with_progress, normalize_depth,
+    probe_player_external_elo, prune_player_elo_job_history, read_player_elo_job,
+    write_player_elo_job,
 };
 use crate::services::tools::{
     game_settings_locked, set_game_settings_locked as set_settings_locked,
@@ -1453,6 +1454,69 @@ pub fn cancel_stats_load(request_id: String) {
     }
 }
 
+/// 按 Windows 命令行习惯切分「程序 + 参数」，支持用双引号包住带空格的路径。
+/// 例：`"E:\YD\ShadowBot\ShadowBot.exe" shadowbot:Run?robot-uuid=xxx` → 2 段。
+fn split_command_line(text: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut started = false;
+
+    for ch in text.trim().chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                started = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if started {
+                    parts.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+
+    if started {
+        parts.push(current);
+    }
+    parts
+}
+
+/// 启动一个外部命令（这里用来唤起影刀 RPA 的 `shadowbot:Run?robot-uuid=` 指令）。
+/// 只负责拉起进程、不等待结果 —— 影刀自己会读剪贴板把截图发出去。
+#[tauri::command]
+pub fn run_external_command(command: String) -> Result<(), String> {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let parts = split_command_line(&command);
+    let program = parts
+        .first()
+        .ok_or_else(|| "命令为空，请先在设置里填写影刀命令".to_string())?
+        .clone();
+
+    let mut child = std::process::Command::new(&program);
+    if parts.len() > 1 {
+        child.args(&parts[1..]);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        child.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    child
+        .spawn()
+        .map_err(|error| format!("启动外部命令失败（{program}）：{error}"))?;
+
+    Ok(())
+}
+
 #[tauri::command]
 pub fn copy_png_to_clipboard(bytes: Vec<u8>) -> Result<(), String> {
     let image = image::load_from_memory(&bytes)
@@ -1837,25 +1901,6 @@ pub async fn load_live_game(depth: usize) -> Result<LiveGameResponse, String> {
     }
 
     Err(app_error(AppError::LiveGameUnavailable))
-}
-
-/// 查询指定账号（puuid）当前是否在游戏中，并返回进行中对局的双方阵容。
-#[tauri::command]
-pub async fn query_player_active_game(
-    puuid: String,
-    sgp_server_id: Option<String>,
-) -> Result<PlayerActiveGame, String> {
-    let clients = create_clients().map_err(app_error)?;
-    let sgp = crate::services::sgp::SgpClient::new(
-        &clients.lcu,
-        &clients.auth,
-        sgp_server_id.as_deref(),
-    )
-    .await
-    .map_err(app_error)?;
-    sgp.active_game_by_puuid(puuid.trim())
-        .await
-        .map_err(app_error)
 }
 
 async fn resolve_summoner(clients: &Clients, query: &str) -> AppResult<SummonerInfo> {
@@ -2552,6 +2597,38 @@ fn fallback_live_summoner(seed: &LivePlayerSeed) -> SummonerInfo {
 mod tests {
     use super::*;
     use crate::services::stats::load_player_stats;
+
+    #[test]
+    fn split_command_line_keeps_quoted_paths_together() {
+        assert_eq!(
+            split_command_line(
+                r#""E:\YD\ShadowBot\ShadowBot.exe" shadowbot:Run?robot-uuid=abc-123"#
+            ),
+            vec![
+                r"E:\YD\ShadowBot\ShadowBot.exe".to_string(),
+                "shadowbot:Run?robot-uuid=abc-123".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_command_line_handles_plain_and_empty() {
+        assert_eq!(
+            split_command_line("taskkill /f /im ShadowBot.exe"),
+            vec![
+                "taskkill".to_string(),
+                "/f".to_string(),
+                "/im".to_string(),
+                "ShadowBot.exe".to_string(),
+            ]
+        );
+        assert!(split_command_line("   ").is_empty());
+    }
+
+    #[test]
+    fn run_external_command_rejects_empty() {
+        assert!(run_external_command("   ".to_string()).is_err());
+    }
 
     #[tokio::test]
     #[ignore = "手动触发：依赖本机已启动的国服客户端和有效登录态"]

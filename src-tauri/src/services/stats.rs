@@ -34,7 +34,12 @@ const MAX_DEPTH: usize = 3000;
 const MIN_VALID_GAME_DURATION_SECONDS: i64 = 8 * 60;
 const STATS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DATABASE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
-const CACHE_SCHEMA_VERSION: i64 = 14;
+/// 缓存库 schema 版本。
+///
+/// **改动 schema 时必须同步 +1**，否则迁移分支不会执行。
+/// 曾踩过的坑：给某张表补了列却忘记升版本号，导致老库里这列永远不存在，
+/// 依赖它的 SQL 直接报错（还被静默吞掉），表现成「功能看起来像坏了」。
+const CACHE_SCHEMA_VERSION: i64 = 17;
 const DATABASE_FILE_NAME: &str = "lol-stats.sqlite3";
 const HISTORY_PREMADE_THRESHOLD: usize = 3;
 const PLAYER_ELO_SAMPLE_TARGET: usize = 10;
@@ -56,6 +61,41 @@ const EXTERNAL_ELO_RETRY_DELAY: Duration = Duration::from_millis(1100);
 const EXTERNAL_ELO_REFERER: &str = "https://a.lzyumi.top/";
 const EXTERNAL_ELO_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
+
+/// 确保 `match_cache` 上有**形状正确**的性能索引。
+///
+/// 不能只用 `CREATE INDEX IF NOT EXISTS`：如果库里已存在同名但列不对的
+/// 旧索引（例如早期只有两列的版本），`IF NOT EXISTS` 会直接跳过，
+/// 于是 `MIN(game_creation)` 依然慢。这里先比对列，形状不符就重建。
+fn ensure_match_queue_index(conn: &Connection) {
+    const INDEX: &str = "idx_match_queue";
+    const WANTED: [&str; 3] = ["sgp_server_id", "queue_id", "game_creation"];
+
+    let existing: Vec<String> = conn
+        .prepare(&format!("PRAGMA index_info({INDEX})"))
+        .and_then(|mut stmt| {
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(2))?
+                .filter_map(|row| row.ok())
+                .collect();
+            Ok(cols)
+        })
+        .unwrap_or_default();
+
+    // 存在但形状不对 -> 先删掉，下面重建。
+    if !existing.is_empty() && existing != WANTED {
+        eprintln!("[db] {INDEX} 列不匹配（现有 {existing:?}），正在重建");
+        if let Err(error) = conn.execute(&format!("DROP INDEX IF EXISTS {INDEX}"), []) {
+            eprintln!("[db] 删除旧索引失败: {error:?}");
+            return;
+        }
+    }
+
+    let sql = format!("CREATE INDEX IF NOT EXISTS {INDEX} ON match_cache (sgp_server_id, queue_id, game_creation)");
+    if let Err(error) = conn.execute(&sql, []) {
+        eprintln!("[db] 创建 {INDEX} 失败: {error:?}");
+    }
+}
 
 static STATS_CACHE: LazyLock<Mutex<HashMap<StatsCacheKey, StatsCacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1416,7 +1456,10 @@ fn open_cache_db() -> Option<Connection> {
     fs::create_dir_all(parent).ok()?;
 
     let conn = Connection::open(path).ok()?;
-    initialize_cache_schema(&conn).ok()?;
+    if let Err(error) = initialize_cache_schema(&conn) {
+        eprintln!("[db] 初始化缓存库失败: {error:?}");
+        return None;
+    }
     Some(conn)
 }
 
@@ -1514,6 +1557,7 @@ fn initialize_cache_schema(conn: &Connection) -> rusqlite::Result<()> {
         .optional()?;
 
     if stored_version != Some(CACHE_SCHEMA_VERSION) {
+        // 版本变化时清掉与 JSON 格式绑定的缓存表。
         conn.execute_batch(
             r#"
             DELETE FROM stats_cache;
@@ -1521,6 +1565,9 @@ fn initialize_cache_schema(conn: &Connection) -> rusqlite::Result<()> {
             DELETE FROM player_match_index;
             DELETE FROM player_elo_cache;
             DELETE FROM external_elo_cache;
+            -- 玩家池是 known_player 的冗余派生视图（库里的玩家全集），
+            -- 且正是「递归永远不启动」的 bug 根源。彻底废弃。
+            DROP TABLE IF EXISTS known_player;
             "#,
         )?;
         conn.execute(
@@ -1532,6 +1579,10 @@ fn initialize_cache_schema(conn: &Connection) -> rusqlite::Result<()> {
             params![CACHE_SCHEMA_VERSION],
         )?;
     }
+
+    // match_cache 的性能索引单独处理：需要比对列形状，不能只靠 IF NOT EXISTS。
+    // 详见 ensure_match_queue_index 的说明与实测数据。
+    ensure_match_queue_index(conn);
 
     Ok(())
 }
@@ -4268,4 +4319,106 @@ mod tests {
         println!("info payload => {}", response.info_payload);
         println!("rank payload => {}", response.rank_payload);
     }
+
+    /// 生成 SQL IN 子句的 `?,?,?` 占位符串。
+    fn placeholders(count: usize) -> String {
+        std::iter::repeat("?")
+            .take(count)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// 回归测试：`match_cache` 的性能索引必须**形状正确**。
+    ///
+    /// 这条索引同时服务 `COUNT(*)` 和 `MIN(game_creation)` 两个热查询。
+    /// 关键在于第三列 `game_creation`：
+    ///   - 少了它，`MIN(game_creation)` 要回表读数据页 ——
+    ///     实测 2,649,051 行 / 24.7 GB 的库上要 **2,525 ms**；
+    ///   - 有了它，查询退化成纯索引定位 —— **0.01 ms**。
+    ///
+    /// 而 `CREATE INDEX IF NOT EXISTS` 遇到「同名但列不对」的旧索引会
+    /// 直接跳过，所以必须有「比对列 + 重建」的逻辑。这条测试就守这个行为。
+    #[test]
+    fn match_cache_index_has_correct_shape() {
+        let conn = Connection::open_in_memory().expect("内存库");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE match_cache (
+                sgp_server_id TEXT NOT NULL,
+                game_id INTEGER NOT NULL,
+                game_creation INTEGER NOT NULL,
+                queue_id INTEGER NOT NULL,
+                game_json TEXT NOT NULL,
+                PRIMARY KEY (sgp_server_id, game_id)
+            );
+            -- 故意造一个「两列」的旧索引，模拟早期版本留下的错误形状。
+            CREATE INDEX idx_match_queue ON match_cache (sgp_server_id, queue_id);
+            "#,
+        )
+        .expect("建表");
+
+        let read_columns = |conn: &Connection| -> Vec<String> {
+            conn.prepare("PRAGMA index_info(idx_match_queue)")
+                .and_then(|mut stmt| {
+                    let cols: Vec<String> = stmt
+                        .query_map([], |row| row.get::<_, String>(2))?
+                        .filter_map(|row| row.ok())
+                        .collect();
+                    Ok(cols)
+                })
+                .unwrap_or_default()
+        };
+
+        assert_eq!(
+            read_columns(&conn),
+            vec!["sgp_server_id", "queue_id"],
+            "前置条件：先确认旧索引确实是两列"
+        );
+
+        // 自愈入口应发现形状不符并重建。
+        ensure_match_queue_index(&conn);
+
+        assert_eq!(
+            read_columns(&conn),
+            vec!["sgp_server_id", "queue_id", "game_creation"],
+            "应重建为三列覆盖索引（含 game_creation，MIN 才不用回表）"
+        );
+
+        // 幂等：再调一次不应改变任何东西。
+        ensure_match_queue_index(&conn);
+        assert_eq!(
+            read_columns(&conn),
+            vec!["sgp_server_id", "queue_id", "game_creation"],
+            "重复调用应保持幂等"
+        );
+    }
+
+    /// 回归测试：IN 子句占位符数量必须与传入的 id 数一致。
+    ///
+    /// 这里曾静默失败过——`take(count + 1)` 让占位符比实参多一个，
+    /// `prepare` 报错被 `else { continue }` 吞掉，表现成「没有协同玩家」。
+    #[test]
+    fn sql_placeholders_match_arg_count() {
+        assert_eq!(placeholders(1), "?");
+        assert_eq!(placeholders(3), "?,?,?");
+
+        // 用内存库真实 prepare 一次，确保占位符数与绑定数严格一致。
+        let conn = rusqlite::Connection::open_in_memory().expect("内存库");
+        conn.execute_batch(
+            "CREATE TABLE match_cache (sgp_server_id TEXT, game_id INTEGER, game_json TEXT);",
+        )
+        .expect("建表");
+
+        for count in [1usize, 2, 5, 400] {
+            let ids: Vec<u64> = (0..count as u64).collect();
+            let ph = placeholders(ids.len());
+            let sql = format!(
+                "SELECT game_json FROM match_cache WHERE sgp_server_id = ? AND game_id IN ({ph})"
+            );
+            // 参数个数不匹配时 prepare 会在这里失败——正是当年被吞掉的错误。
+            conn.prepare(&sql)
+                .unwrap_or_else(|e| panic!("count={count} 时占位符与实参不匹配: {e}"));
+        }
+    }
+
 }

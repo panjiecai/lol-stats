@@ -13,6 +13,7 @@ import type {
 } from "../types"
 import { mitigationValue, riotId, teamMitigationValue } from "../utils"
 import {
+  clampStatsDepth,
   MAX_STATS_DEPTH,
   STATS_DEPTH_OPTIONS,
 } from "../statsDepth"
@@ -64,6 +65,7 @@ const statsDateStart = ref("")
 const statsDateEnd = ref("")
 const statsDatePickerOpen = ref(false)
 const soloOnly = ref(false)
+const includeArenaTournament = ref(true)
 let statsDepthCloseTimer = 0
 let statsDateCloseTimer = 0
 
@@ -75,6 +77,8 @@ const statsDepthOptions = STATS_DEPTH_OPTIONS
 function isHexAramGame(game: RecentGame) {
   const queueId = game.queueId
   const mode = (game.gameMode || "").toUpperCase()
+  // 海斗大赛（2410）可勾选排除；2400/2450 为海克斯大乱斗本体。
+  if (!includeArenaTournament.value && queueId === 2410) return false
   return (
     [2400, 2410, 2450].includes(queueId) ||
     mode === "STRAWBERRY" ||
@@ -174,6 +178,7 @@ watch(
   [
     () => selectedQueue.value,
     () => soloOnly.value,
+    () => includeArenaTournament.value,
     () => statsDateStart.value,
     () => statsDateEnd.value,
     () => props.fullStats?.depthRequested ?? 0,
@@ -233,7 +238,8 @@ function ensureStatsCoverage() {
 }
 
 function commitStatsDepth() {
-  const nextDepth = clampStatsDepth(statsDepthInput.value)
+  // 用共享的 clamp：允许 1~3000 的任意自定义场次（不再被抬到 50）
+  const nextDepth = clampStatsDepth(statsDepthInput.value, props.statsDepth)
   statsDepthInput.value = String(nextDepth)
   statsDepthPickerOpen.value = false
   if (nextDepth !== props.statsDepth) {
@@ -353,12 +359,6 @@ function refreshActiveTab() {
 function queueCount(option: QueueOption) {
   if (!props.fullStats) return null
   return props.fullStats.recentGames.filter(option.matches).length
-}
-
-function clampStatsDepth(value: unknown) {
-  const numberValue = Number(value)
-  if (!Number.isFinite(numberValue)) return props.statsDepth
-  return Math.min(MAX_STATS_DEPTH, Math.max(50, Math.round(numberValue)))
 }
 
 function buildFilteredStats(
@@ -538,6 +538,10 @@ function round2(value: number) {
             {{ option.label }}
           </button>
           <div class="queue-tools">
+            <label class="stats-toggle" v-if="selectedQueue === 'arena'">
+              <input v-model="includeArenaTournament" type="checkbox" />
+              <span>含海斗大赛</span>
+            </label>
             <label class="stats-toggle">
               <input v-model="soloOnly" type="checkbox" />
               <span>单人开局</span>
@@ -568,6 +572,7 @@ function round2(value: number) {
             </div>
             <label
               class="stats-depth-control"
+              :title="`统计口径的对局数量上限，可自定义 1~${MAX_STATS_DEPTH}（回车或点击空白处生效）`"
               @focusin="openStatsDepthPicker"
               @focusout="scheduleStatsDepthPickerClose"
             >
@@ -579,6 +584,7 @@ function round2(value: number) {
                 pattern="[0-9]*"
                 autocomplete="off"
                 spellcheck="false"
+                placeholder="自定义"
                 :disabled="loading"
                 @click="openStatsDepthPicker"
                 @input="normalizeStatsDepthInput"

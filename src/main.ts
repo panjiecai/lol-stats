@@ -1,5 +1,6 @@
 import { createApp } from "vue";
 import App from "./App.vue";
+import "./bullChip.css";
 
 // 渲染期错误兜底：把异常画到页面上，避免出现无提示的黑屏。
 function showFatalError(title: string, detail: string) {

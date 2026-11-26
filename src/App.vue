@@ -9,6 +9,7 @@ import {
   ChevronRight,
   FileText,
   LoaderCircle,
+  RadioTower,
   RefreshCw,
   Search,
   Settings,
@@ -38,9 +39,9 @@ import {
   searchSummonerCandidates,
   startPlayerEloEstimateTask,
 } from "./api"
-import ActiveGamePanel from "./components/ActiveGamePanel.vue"
 import LiveGamePanel from "./components/LiveGamePanel.vue"
 import MatchOverviewPanel from "./components/MatchOverviewPanel.vue"
+import MonitorPanel from "./components/MonitorPanel.vue"
 import PlayerRecordTab from "./components/PlayerRecordTab.vue"
 import RecordView from "./components/RecordView.vue"
 import RecordWatchToolbar from "./components/RecordWatchToolbar.vue"
@@ -56,6 +57,15 @@ import {
   searchServerOptions,
 } from "./servers"
 import { AUTO_ACCEPT_ENABLED_KEY, readBooleanSetting } from "./toolSettings"
+import {
+  rpaNotifyCommand,
+  rpaNotifyEnabled,
+  rpaNotifyKillFirst,
+  runRpaNotify,
+  setRpaNotifyCommand,
+  setRpaNotifyEnabled,
+  setRpaNotifyKillFirst,
+} from "./rpaNotify"
 import { championName, riotId } from "./utils"
 import {
   DEFAULT_STATS_DEPTH,
@@ -82,7 +92,7 @@ import type {
   SummonerSearchCandidate,
 } from "./types"
 
-type PageKey = "current" | "live" | "search" | "details" | "tools" | "eloQueue"
+type PageKey = "current" | "live" | "search" | "details" | "tools" | "eloQueue" | "monitor"
 type SearchHistoryItem = { query: string; sgpServerId: string }
 type OverviewDrillTab = {
   id: string
@@ -149,6 +159,7 @@ const WINDOW_STARTUP_SIZE_KEY = "lol-stats.window-startup-size"
 const LIVE_CARD_EXTRA_HEIGHT_KEY = "lol-stats.live-card-extra-height"
 const RELEASE_NOTES_SEEN_VERSION_KEY = "lol-stats.release-notes.seen-version"
 const RELEASE_NOTES_DISABLED_KEY = "lol-stats.release-notes.disabled"
+const UPDATE_NOTICE_SEEN_VERSION_KEY = "lol-stats.update-notice.seen-version"
 const MIN_PROGRESS_VISIBLE_MS = 700
 const HIDDEN_DRILL_CACHE_MS = 10 * 60 * 1000
 const HIDDEN_DRILL_CACHE_LIMIT = 20
@@ -177,6 +188,22 @@ const DEFAULT_SHARE_SETTINGS: ShareSettings = {
   mobileShareLayout: true,
 }
 const LOCAL_RELEASE_NOTES: Record<string, string[]> = {
+  "0.7.2": [
+    "修复「轮询新战绩」偶尔有新对局却不执行的问题：改用自循环调度，加入卡死看门狗与回到前台自动补偿，导出失败也不再丢帧。",
+    "新增「监控面板」页面：可同时盯住多个账号，谁打完新对局就自动导出详情图（可继续经影刀推送到微信），多账号命中时按顺序逐个截图。",
+    "牛牛新增「取前5位」开关：打开后伤害超过 5 位时只按前 5 位算牌，不再在全部位数里挑最大的组合。",
+  ],
+  "0.7.1": [
+    "移除「实时状态 / 深战绩」面板及相关功能。",
+    "移除「递归爬取」数据采集功能与入口。",
+    "清理历史对局缓存数据库，显著降低本地磁盘占用。",
+    "战绩详情新增「牛牛」牌型计算，可一键开关；按牛牛 / 牛8·牛9 / 有牛 / 没牛四档区分配色与特效。",
+    "牛牛同牌型（点数相同）时按牌面从大到小逐位比大小定先后，0 按 10 点计；牌面完全一样才并列。",
+    "牛气排行榜里的英雄头像放大到原来的 2 倍。",
+    "新增牛气排行榜，只统计当前账号所在队伍（同一边），不再双边混排。",
+    "数据统计的对局数量支持自定义（1~3000 场），不再强制按 50 场计算。",
+    "设置新增微信推送：导出或轮询截图后可自动唤起影刀 RPA，把图片发送到微信。",
+  ],
   "0.7.0": [
     "数据统计新增数据筛选入口，支持阵营、装备、经济区间、百分比穿透和核心担当分析。",
     "新增海克斯分析，可按英雄和位置筛选同色有效机会、登场率与胜率。",
@@ -191,7 +218,7 @@ const LOCAL_RELEASE_NOTES: Record<string, string[]> = {
   "0.6.0": [
     "查战绩支持不限区服候选搜索，精确 Riot ID 可直接打开玩家总览。",
     "新增段位图标，并完善他人总览和详细战绩中的段位展示。",
-    "数据统计新增英雄搜索、日期筛选、前五英雄池和位置分布优化。",
+    "数据统计新增英雄搜索、日期筛选、前5英雄池和位置分布优化。",
     "优化评分系统、死亡修正与详细战绩页面状态保持。",
   ],
   "0.5.1": [
@@ -311,6 +338,7 @@ const pageScrollTop: Record<PageKey, number> = {
   details: 0,
   tools: 0,
   eloQueue: 0,
+  monitor: 0,
 }
 
 const championMap = computed(() => {
@@ -355,17 +383,13 @@ const liveAramkitChampionId = computed(() => {
   return championId > 0 && championMap.value[championId] ? championId : null
 })
 
-const searchPuuid = computed(
-  () =>
-    searchRecentStats.value?.summoner?.puuid || searchFullStats.value?.summoner?.puuid || "",
-)
-
 const navItems: Array<{ key: PageKey; label: string; icon: typeof UserRound }> = [
   { key: "current", label: "当前角色", icon: UserRound },
   { key: "live", label: "实时战绩", icon: Swords },
   { key: "search", label: "查战绩", icon: Search },
   { key: "details", label: "详细战绩", icon: FileText },
   { key: "tools", label: "工具", icon: Wrench },
+  { key: "monitor", label: "监控面板", icon: RadioTower },
   { key: "eloQueue", label: "运算队列", icon: LoaderCircle },
 ]
 
@@ -601,6 +625,52 @@ function notifyError(title: string, error: unknown) {
   })
 }
 
+// --- 微信推送（影刀 RPA）设置 ---
+const rpaCommandDraft = ref(rpaNotifyCommand.value)
+const rpaTesting = ref(false)
+const RPA_COMMAND_PLACEHOLDER = '"D:\\ShadowBot\\ShadowBot.exe" shadowbot:Run?robot-uuid=你的应用UUID'
+
+function onRpaEnabledChange(event: Event) {
+  setRpaNotifyEnabled((event.target as HTMLInputElement).checked)
+}
+
+function onRpaKillFirstChange(event: Event) {
+  setRpaNotifyKillFirst((event.target as HTMLInputElement).checked)
+}
+
+function persistRpaCommand() {
+  setRpaNotifyCommand(rpaCommandDraft.value)
+}
+
+async function testRpaNotify() {
+  if (rpaTesting.value) return
+  persistRpaCommand()
+  if (!rpaCommandDraft.value.trim()) {
+    showToast({
+      kind: "error",
+      title: "请先填写影刀命令",
+      message: `形如 ${RPA_COMMAND_PLACEHOLDER}`,
+      duration: 8000,
+    })
+    return
+  }
+
+  rpaTesting.value = true
+  try {
+    await runRpaNotify()
+    showToast({
+      kind: "success",
+      title: "已唤起影刀",
+      message: "请确认微信是否收到截图；若没反应，多半是流程还没在影刀里「发布」",
+      duration: 8000,
+    })
+  } catch (error) {
+    notifyError("唤起影刀失败", error)
+  } finally {
+    rpaTesting.value = false
+  }
+}
+
 function releaseNotesForVersion(version: string) {
   return LOCAL_RELEASE_NOTES[version] ?? DEFAULT_RELEASE_NOTES
 }
@@ -664,6 +734,12 @@ async function checkForAppUpdate() {
     if (!update.hasUpdate) return
 
     if (!appCurrentVersion.value) appCurrentVersion.value = update.currentVersion
+
+    // 同一个新版本提示只弹一次，之后启动不再反复打扰；
+    // 出现更新的版本时（latestVersion 变化）会再提示一次。
+    if (localStorage.getItem(UPDATE_NOTICE_SEEN_VERSION_KEY) === update.latestVersion) return
+    localStorage.setItem(UPDATE_NOTICE_SEEN_VERSION_KEY, update.latestVersion)
+
     showAppUpdateDialog(update)
   } catch {
     // 更新提示不能影响主流程；网络失败或更新源不可达时静默跳过。
@@ -2290,6 +2366,10 @@ onUnmounted(() => {
         />
       </section>
 
+      <section class="monitor-page" v-show="activePage === 'monitor'">
+        <MonitorPanel :champions="championMap" :game-assets="gameAssets" />
+      </section>
+
       <section class="search-page" v-show="activePage === 'search'">
         <section class="search-landing" v-if="!activeSearchQuery">
           <div class="search-center">
@@ -2365,13 +2445,6 @@ onUnmounted(() => {
         </section>
 
         <section class="search-result" v-else>
-          <ActiveGamePanel
-            v-if="searchPuuid"
-            :puuid="searchPuuid"
-            :sgp-server-id="activeSearchServerId"
-            :champions="championMap"
-            :game-assets="gameAssets"
-          />
           <RecordView
             :recent-stats="searchRecentStats"
             :full-stats="searchFullStats"
@@ -2523,6 +2596,59 @@ onUnmounted(() => {
               @change="persistShareSettings"
             />
           </label>
+        </section>
+
+        <section class="settings-section">
+          <div class="settings-section-title">
+            <span>微信推送</span>
+            <strong>影刀 RPA 自动发送截图</strong>
+          </div>
+
+          <label class="settings-toggle">
+            <span>导出截图后自动唤起影刀发送到微信</span>
+            <input
+              type="checkbox"
+              :checked="rpaNotifyEnabled"
+              @change="onRpaEnabledChange"
+            />
+          </label>
+
+          <label class="settings-rpa-command">
+            <span>影刀唤起命令</span>
+            <input
+              v-model="rpaCommandDraft"
+              type="text"
+              spellcheck="false"
+              :placeholder="RPA_COMMAND_PLACEHOLDER"
+              @change="persistRpaCommand"
+            />
+          </label>
+
+          <p class="settings-hint">
+            在影刀里把流程「发布」后，到「应用 → 更多 → 应用信息」复制 UUID 填进命令。
+            草稿或「编辑中」的流程无法被外部唤起；「我开发的指令」是给别人复用的积木，
+            也不能直接唤起，需要单独建一个只调用它的应用再发布。
+          </p>
+
+          <p class="settings-hint">
+            流程里要「先获取剪贴板图片、再搜索群名」——影刀搜索群/联系人也是靠剪贴板往输入框粘贴，
+            顺序反了或中途重写剪贴板，图或群名都会被顶掉。
+          </p>
+
+          <label class="settings-toggle">
+            <span>发送前先结束影刀进程（影刀开着时唤起常常不生效）</span>
+            <input
+              type="checkbox"
+              :checked="rpaNotifyKillFirst"
+              @change="onRpaKillFirstChange"
+            />
+          </label>
+
+          <div class="settings-actions">
+            <button :disabled="rpaTesting" @click="testRpaNotify">
+              {{ rpaTesting ? "唤起中" : "试运行" }}
+            </button>
+          </div>
         </section>
       </section>
     </div>
@@ -2823,7 +2949,8 @@ button:disabled {
 .current-page,
 .search-page,
 .search-result,
-.queue-page {
+.queue-page,
+.monitor-page {
   display: flex;
   flex-direction: column;
   gap: 18px;
@@ -3794,5 +3921,29 @@ button:disabled {
 
 .settings-toggle {
   cursor: pointer;
+}
+
+/* 影刀命令是一整条命令行，需要占满整行 */
+.settings-modal .settings-rpa-command {
+  display: block;
+}
+
+.settings-rpa-command > span {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.settings-modal .settings-rpa-command input {
+  width: 100%;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.settings-hint {
+  margin: 0;
+  color: #63736f;
+  font-size: 12px;
+  line-height: 1.65;
 }
 </style>

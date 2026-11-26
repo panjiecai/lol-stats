@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue"
+import { ref, watch } from "vue"
 import { loadRankedStats, searchPlayer } from "../api"
 import type {
   ChampionSummaryItem,
@@ -9,10 +9,9 @@ import type {
   RankedStatsResponse,
   ShareSettings,
 } from "../types"
-import ActiveGamePanel from "./ActiveGamePanel.vue"
 import RecordView from "./RecordView.vue"
 import RecordWatchToolbar from "./RecordWatchToolbar.vue"
-import { MAX_RECENT_DEPTH, MAX_STATS_DEPTH } from "../statsDepth"
+import { clampStatsDepth, MAX_RECENT_DEPTH } from "../statsDepth"
 
 const RECENT_PAGE_SIZE = 20
 const DEFAULT_STATS_DEPTH = 100
@@ -133,7 +132,8 @@ async function loadRanked(forceRefresh = false) {
 }
 
 function changeStatsDepth(depth: number) {
-  const nextDepth = Math.min(MAX_STATS_DEPTH, Math.max(50, Math.round(Number(depth) || DEFAULT_STATS_DEPTH)))
+  // 允许任意自定义场次（1~3000），不再向上取整到 50
+  const nextDepth = clampStatsDepth(depth, DEFAULT_STATS_DEPTH)
   if (nextDepth === statsDepth.value && fullStats.value) return
 
   statsDepth.value = nextDepth
@@ -145,7 +145,7 @@ function changeStatsDepth(depth: number) {
 }
 
 function ensureStatsDepth(depth: number) {
-  const nextDepth = Math.min(MAX_STATS_DEPTH, Math.max(50, Math.round(Number(depth) || DEFAULT_STATS_DEPTH)))
+  const nextDepth = clampStatsDepth(depth, DEFAULT_STATS_DEPTH)
   if (nextDepth <= statsFetchDepth.value) return
 
   statsFetchDepth.value = nextDepth
@@ -160,21 +160,10 @@ watch(
   },
   { immediate: true },
 )
-
-const ownerPuuid = computed(
-  () => recentStats.value?.summoner?.puuid || fullStats.value?.summoner?.puuid || "",
-)
 </script>
 
 <template>
   <div class="player-record-tab">
-    <ActiveGamePanel
-      v-if="ownerPuuid"
-      :puuid="ownerPuuid"
-      :sgp-server-id="sgpServerId"
-      :champions="champions"
-      :game-assets="gameAssets"
-    />
     <RecordView
       :recent-stats="recentStats"
       :full-stats="fullStats"

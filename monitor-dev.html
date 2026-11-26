@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>监控面板烟测 · lol-stats</title>
+    <style>
+      :root {
+        font-family: Inter, "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+        color: #263238;
+      }
+      body {
+        margin: 0;
+        background:
+          linear-gradient(135deg, rgba(46, 125, 107, 0.13), transparent 34%),
+          linear-gradient(315deg, rgba(229, 184, 75, 0.18), transparent 30%),
+          #eef4f2;
+      }
+      .dev-root {
+        padding: 26px;
+        max-width: 1200px;
+      }
+      .toast-log {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 20px;
+      }
+      .toast-item {
+        display: flex;
+        gap: 8px;
+        border-left: 3px solid #1f5f56;
+        border-radius: 0 8px 8px 0;
+        background: #ffffff;
+        color: #315f58;
+        font-size: 12px;
+        padding: 8px 12px;
+      }
+      .toast-item.error { border-left-color: #a94745; }
+      .toast-item.success { border-left-color: #1f5f56; }
+      .toast-item.info { border-left-color: #2b7fa8; }
+      .toast-item strong { color: #12312c; }
+    </style>
+  </head>
+  <body>
+    <div id="monitor-dev"></div>
+    <script type="module" src="/src/dev/monitorDev.ts"></script>
+  </body>
+</html>

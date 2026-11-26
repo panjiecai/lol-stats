@@ -1072,38 +1072,6 @@ pub struct LivePremadeMarker {
     pub member_puuids: Vec<String>,
 }
 
-/// 指定账号的实时对局查询结果（SGP 观战服务）。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlayerActiveGame {
-    pub in_game: bool,
-    pub game_id: Option<i64>,
-    pub queue_config_id: Option<i32>,
-    pub queue_type_name: Option<String>,
-    pub game_mode: Option<String>,
-    pub game_state: Option<String>,
-    pub teams: Vec<ActiveGameTeam>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActiveGameTeam {
-    pub name: String,
-    pub players: Vec<ActiveGamePlayer>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActiveGamePlayer {
-    pub puuid: String,
-    pub summoner_name: String,
-    pub champion_id: u32,
-    pub spell1_id: u32,
-    pub spell2_id: u32,
-    pub profile_icon_id: u32,
-    pub position: String,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiotAlias {
     pub puuid: String,

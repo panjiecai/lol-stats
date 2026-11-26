@@ -2,6 +2,19 @@
 import { computed, inject, ref } from "vue"
 import { ClipboardCopy } from "lucide-vue-next"
 import { loadMatchDetail } from "../api"
+import {
+  buildBullBoard,
+  bullDetailEnabled,
+  bullDrawRuleText,
+  bullLeadingFiveOnly,
+  bullPlayerKey,
+  bullRankLine,
+  bullTierClass,
+  bullTitle as bullDisplayTitle,
+  findOwnerTeam,
+  toggleBullDetail,
+  toggleBullLeadingFiveOnly,
+} from "../bullDisplay"
 import { copyElementAsPng } from "../imageShare"
 import { matchTeamSummary } from "../matchTeamSummary"
 import { notifyKey } from "../notifications"
@@ -17,6 +30,7 @@ import type {
 } from "../types"
 import { computeBull, fixed, formatDate, mitigationValue, teamMitigationValue } from "../utils"
 import AssetIcon from "./AssetIcon.vue"
+import BullRankBoard from "./BullRankBoard.vue"
 import ChampionAvatar from "./ChampionAvatar.vue"
 
 const props = defineProps<{
@@ -265,13 +279,51 @@ function detailStatLeader(game: RecentGame, kind: "damage" | "gold" | "mitigatio
   }
 }
 
+// 牛气排行只按单边排：本队优先，拿不到 owner 就退回列表里的第一支队伍（绝不含对面）
+const bullScopeTeams = computed(() => {
+  const teams = matchDetail.value?.teams || []
+  const side = findOwnerTeam(teams, props.ownerPuuid, props.ownerLabel) || teams[0]
+  return side ? [side] : []
+})
+
+const bullBoard = computed(() => buildBullBoard(bullScopeTeams.value))
+
+const bullBoardTitle = computed(() =>
+  bullBoard.value.scope === "team"
+    ? `牛气排行 · ${bullBoard.value.teamName || "本队"}`
+    : "牛气排行 · 全场",
+)
+
+function bullEntryOf(player: MatchDetailPlayer) {
+  return bullBoard.value.byKey[bullPlayerKey(player)]
+}
+
 function bullOf(player: MatchDetailPlayer) {
-  return computeBull(player.damageToChampions)
+  return (
+    bullEntryOf(player)?.result ??
+    computeBull(player.damageToChampions, { leadingFiveOnly: bullLeadingFiveOnly.value })
+  )
 }
 
 function bullTitle(player: MatchDetailPlayer) {
-  const bull = bullOf(player)
-  return `伤害 ${player.damageToChampions} → 牌面 ${bull.digits} · ${bull.hasBull ? bull.label : `没牛 · ${bull.label}`}（0 按 10 点计）`
+  const base = bullDisplayTitle(player, bullOf(player))
+  const entry = bullEntryOf(player)
+  return entry ? `${base}\n${bullRankLine(entry, bullBoard.value)}` : base
+}
+
+function bullRankText(player: MatchDetailPlayer) {
+  const entry = bullEntryOf(player)
+  return entry ? `#${entry.rankAll}` : ""
+}
+
+function bullRankClass(player: MatchDetailPlayer) {
+  const entry = bullEntryOf(player)
+  return entry ? `rank-${Math.min(entry.rankAll, 3)}` : ""
+}
+
+function bullRankTitle(player: MatchDetailPlayer) {
+  const entry = bullEntryOf(player)
+  return entry ? bullRankLine(entry, bullBoard.value) : ""
 }
 
 function outputRating(game: RecentGame) {
@@ -499,6 +551,24 @@ async function openMatchDetail(game: RecentGame) {
           </div>
           <div class="match-detail-actions">
             <button
+              class="match-detail-bull-toggle"
+              :class="{ off: !bullDetailEnabled }"
+              :title="`战绩详情的牛牛牌型与牛气排行，默认开启（当前${bullDetailEnabled ? '已开启' : '已关闭'}，设置会记住）`"
+              @click="toggleBullDetail"
+            >
+              <span class="bull-toggle-dot"></span>
+              牛牛 {{ bullDetailEnabled ? "开" : "关" }}
+            </button>
+            <button
+              class="match-detail-bull-toggle match-detail-draw-toggle"
+              :class="{ off: !bullLeadingFiveOnly }"
+              :title="`伤害超过 5 位的取牌口径：${bullDrawRuleText()}（点击切换）`"
+              @click="toggleBullLeadingFiveOnly"
+            >
+              <span class="bull-toggle-dot"></span>
+              取前5位 {{ bullLeadingFiveOnly ? "开" : "关" }}
+            </button>
+            <button
               class="match-detail-analyze"
               :disabled="detailImageCopying || detailLoading || !matchDetail"
               @click="copyMatchAnalysisImage"
@@ -514,6 +584,13 @@ async function openMatchDetail(game: RecentGame) {
         <div class="match-detail-state error" v-else-if="detailError">{{ detailError }}</div>
 
         <div class="match-detail-body" v-else-if="matchDetail">
+          <BullRankBoard
+            v-if="bullDetailEnabled && bullBoard.entries.length"
+            :board="bullBoard"
+            :champions="champions"
+            :owner-puuid="ownerPuuid"
+            :title="bullBoardTitle"
+          />
           <section
             v-for="team in matchDetail.teams"
             :key="team.teamId"
@@ -612,7 +689,15 @@ async function openMatchDetail(game: RecentGame) {
                   <strong :class="{ leader: detailStatLeader(player, 'damage') }">
                     {{ kNumber(player.damageToChampions) }}<em class="damage-sub">
                       <span>{{ shareSuffix(player.damageToChampions, player.teamDamageToChampions) }}</span>
-                      <b class="bull-chip" :class="`bull-${bullOf(player).tier}`" :title="bullTitle(player)">{{ bullOf(player).label }}</b>
+                      <template v-if="bullDetailEnabled">
+                        <b class="bull-chip" :class="bullTierClass(bullOf(player).tier)" :title="bullTitle(player)">{{ bullOf(player).label }}</b>
+                        <em
+                          v-if="bullRankText(player)"
+                          class="bull-rank-badge"
+                          :class="bullRankClass(player)"
+                          :title="bullRankTitle(player)"
+                        >{{ bullRankText(player) }}</em>
+                      </template>
                     </em>
                   </strong>
                 </div>
@@ -1340,29 +1425,59 @@ async function openMatchDetail(game: RecentGame) {
   gap: 3px;
 }
 
-.bull-chip {
-  border-radius: 999px;
-  font-size: 9.5px;
-  font-weight: 900;
-  font-style: normal;
-  line-height: 1;
-  padding: 2px 4px;
-  white-space: nowrap;
+/* 牛牛徽章与排名徽章的配色在全局样式 bullChip.css 里统一定义 */
+
+.match-detail-bull-toggle {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  border-radius: 8px;
+  color: #8a4a12;
+  background: #fff3d6;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 7px 10px;
 }
 
-.bull-chip.bull-bull {
-  color: #5d3300;
-  background: linear-gradient(135deg, #ffe08a, #ffb03a);
+.match-detail-bull-toggle .bull-toggle-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #ffd447, #ff8a1f);
+  box-shadow: 0 0 6px rgba(255, 138, 31, 0.8);
 }
 
-.bull-chip.bull {
-  color: #145b3e;
-  background: #d9f1e1;
+.match-detail-bull-toggle.off {
+  color: #657179;
+  background: #f0f3f4;
 }
 
-.bull-chip.bull-none {
-  color: #7a4323;
-  background: #f3e3d2;
+.match-detail-bull-toggle.off .bull-toggle-dot {
+  background: #b6c1c4;
+  box-shadow: none;
+}
+
+/* 「超过 5 位只取前 5 位」是取牌口径开关，用青蓝配色和牛牛显示开关区分开 */
+.match-detail-bull-toggle.match-detail-draw-toggle {
+  color: #1c5a70;
+  background: #dcf0f8;
+}
+
+.match-detail-bull-toggle.match-detail-draw-toggle .bull-toggle-dot {
+  background: linear-gradient(135deg, #7fd4f5, #1b7fa8);
+  box-shadow: 0 0 6px rgba(27, 127, 168, 0.75);
+}
+
+.match-detail-bull-toggle.match-detail-draw-toggle.off {
+  color: #657179;
+  background: #f0f3f4;
+}
+
+.match-detail-bull-toggle.match-detail-draw-toggle.off .bull-toggle-dot {
+  background: #b6c1c4;
+  box-shadow: none;
 }
 
 .detail-score-cell {

@@ -62,33 +62,55 @@ export function phaseName(phase?: string) {
   return phase ? map[phase] || phase : "-"
 }
 
+export type BullTier = "bull-bull" | "bull-high" | "bull" | "none"
+
 export type BullResult = {
-  /** bull-bull: 牛牛 / bull: 牛1~牛9 / none: 没牛（按最大牌报 X大） */
-  tier: "bull-bull" | "bull" | "none"
+  /**
+   * bull-bull: 牛牛（牛10）/ bull-high: 牛8~牛9 高档 / bull: 有牛（牛1~牛7）/ none: 没牛（按最大牌报 X大）
+   */
+  tier: BullTier
   label: string
   /** 用于比较：有牛 21~30（牛牛=30），没牛 1~10（0 当 10 计） */
   rank: number
   hasBull: boolean
   /** 参与计算的牌面数字 */
   digits: string
+  /**
+   * 参与计算的牌面点数，从大到小排列（0 当 10 计）。
+   * 牌型档位相同时用它逐位比大小决定先后。
+   */
+  cards: number[]
 }
 
-const BULL_DIGIT_NAME: Record<number, string> = {
-  10: "十",
-  9: "九",
-  8: "八",
-  7: "七",
-  6: "六",
-  5: "五",
-  4: "四",
-  3: "三",
-  2: "二",
-  1: "一",
-}
-
+// 牌型一律用阿拉伯数字展示（牛牛 / 牛9 / 牛5 / 10大），不要中英数混排。
 // 数字 0 在牛牛里按 10 点计
 function bullPoint(digit: number) {
   return digit === 0 ? 10 : digit
+}
+
+function sortPointsDesc(points: number[]) {
+  return [...points].sort((left, right) => right - left)
+}
+
+/**
+ * 比牌：按点数从大到小逐个比，0 当 10，所以 0 比 9 大、9 比 8 大。
+ * 只比双方都有的位数；前缀完全相同算并列，不靠张数硬拆先后。
+ */
+export function comparePointsDesc(left: number[], right: number[]) {
+  const size = Math.min(left.length, right.length)
+  for (let i = 0; i < size; i += 1) {
+    if (left[i] !== right[i]) return left[i] - right[i]
+  }
+  return 0
+}
+
+/**
+ * 两副牌的先后：先比牌型档位，档位相同再逐位比牌面（从最大牌开始）。
+ * 返回 > 0 表示 left 排在 right 前面；返回 0 表示完全打平。
+ */
+export function compareBull(left: BullResult, right: BullResult) {
+  if (left.rank !== right.rank) return left.rank - right.rank
+  return comparePointsDesc(left.cards, right.cards)
 }
 
 // 5 张牌的牌型：任意 3 张之和为 10 的倍数即有牛，
@@ -110,7 +132,16 @@ function bullRankOfFive(points: number[]) {
   return best
 }
 
-export function computeBull(damage: number): BullResult {
+export type BullComputeOptions = {
+  /**
+   * 伤害位数超过 5 位时的取牌方式：
+   * - false / 缺省：在全部位数里任意挑 5 位，取牌型最大的一组（默认，牌面更好看）。
+   * - true：只取数字的前 5 位（高位优先），不做任意组合（取法唯一、可预期）。
+   */
+  leadingFiveOnly?: boolean
+}
+
+export function computeBull(damage: number, options: BullComputeOptions = {}): BullResult {
   const text = String(Math.trunc(damage) || 0)
   const digits = Array.from(text, (ch) => Number(ch))
   let chosen: number[]
@@ -124,10 +155,17 @@ export function computeBull(damage: number): BullResult {
     chosen = digits
     const bull = bullRankOfFive(chosen.map(bullPoint))
     rank = bull > 0 ? 20 + bull : Math.max(...chosen.map(bullPoint))
+  } else if (options.leadingFiveOnly) {
+    // 开关打开：只看数字前 5 位（高位优先），第 6 位起直接忽略，取法唯一可预期。
+    chosen = digits.slice(0, 5)
+    const bull = bullRankOfFive(chosen.map(bullPoint))
+    rank = bull > 0 ? 20 + bull : Math.max(...chosen.map(bullPoint))
   } else {
-    // 多于 5 位：任意取 5 位拼出最大牛
+    // 多于 5 位：任意取 5 位拼出最大牛；档位相同时留牌面更大的那种取法，
+    // 保证同一个人只会有一个确定的牌面，比牌结果才稳定。
     let bestRank = -1
     let bestChoice: number[] = []
+    let bestCards: number[] = []
     const picked: number[] = []
     const n = digits.length
     const walk = (start: number) => {
@@ -135,9 +173,11 @@ export function computeBull(damage: number): BullResult {
         const points = picked.map((id) => bullPoint(digits[id]))
         const bull = bullRankOfFive(points)
         const r = bull > 0 ? 20 + bull : Math.max(...points)
-        if (r > bestRank) {
+        const cards = sortPointsDesc(points)
+        if (r > bestRank || (r === bestRank && comparePointsDesc(cards, bestCards) > 0)) {
           bestRank = r
           bestChoice = picked.map((id) => digits[id])
+          bestCards = cards
         }
         return
       }
@@ -153,11 +193,12 @@ export function computeBull(damage: number): BullResult {
   }
 
   const hasBull = rank >= 21
-  const tier = hasBull ? (rank === 30 ? "bull-bull" : "bull") : "none"
+  const bull = rank - 20
+  const tier: BullTier = hasBull ? (rank === 30 ? "bull-bull" : bull >= 8 ? "bull-high" : "bull") : "none"
   const label = hasBull
     ? rank === 30
       ? "牛牛"
-      : `牛${rank - 20}`
-    : `${BULL_DIGIT_NAME[Math.max(...chosen.map(bullPoint))]}大`
-  return { tier, label, rank, hasBull, digits: chosen.join("") }
+      : `牛${bull}`
+    : `${Math.max(...chosen.map(bullPoint))}大`
+  return { tier, label, rank, hasBull, digits: chosen.join(""), cards: sortPointsDesc(chosen.map(bullPoint)) }
 }
