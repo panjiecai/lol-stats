@@ -26,6 +26,37 @@ export async function copyElementAsPng(
   return readImageSize(blob)
 }
 
+/** 渲染成 PNG 但只返回 base64，不写剪贴板 —— 给后台推送用。 */
+export async function renderElementAsPngBase64(
+  element: HTMLElement,
+  options: CopyElementOptions = {},
+) {
+  await document.fonts?.ready
+  const blob = await toBlob(element, {
+    backgroundColor: options.backgroundColor ?? "#f6faf9",
+    cacheBust: true,
+    pixelRatio: options.pixelRatio ?? 2,
+    filter: options.filter,
+  })
+
+  if (!blob) throw new Error("图片生成失败")
+
+  const bytes = new Uint8Array(await blob.arrayBuffer())
+  return {
+    base64: bytesToBase64(bytes),
+    size: await readImageSize(blob),
+  }
+}
+
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = ""
+  const chunk = 0x8000
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk))
+  }
+  return btoa(binary)
+}
+
 async function readImageSize(blob: Blob) {
   try {
     const url = URL.createObjectURL(blob)

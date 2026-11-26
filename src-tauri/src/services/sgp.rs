@@ -7,9 +7,9 @@ use serde_json::Value;
 use super::error::{AppError, AppResult};
 use super::lcu::LcuClient;
 use super::models::{
-    ActiveGamePlayer, ActiveGameTeam, ClientAuth, Game, GameTeam, IdentityPlayer,
+    ClientAuth, Game, GameTeam, IdentityPlayer,
     OfficialApiDebugResponse, OfficialApiProbeSample, Participant, ParticipantIdentity,
-    ParticipantStats, ParticipantTimeline, PlayerActiveGame, RankedQueueEntry, RankedQueueMap,
+    ParticipantStats, ParticipantTimeline, RankedQueueEntry, RankedQueueMap,
     RankedStatsResponse, SummonerInfo,
 };
 
@@ -25,9 +25,21 @@ const OFFICIAL_PROBE_SAMPLE_COUNT: usize = 3;
 pub struct SgpClient {
     http: Client,
     base_url: String,
+    /// 留一份 LCU 客户端：长爬取中途 token 会过期，遇到 401 时用它重拉一次，
+    /// 免得整段爬取因为一个过期 token 提前失去命中率。
+    lcu: LcuClient,
+    tokens: std::sync::RwLock<SgpTokens>,
+    sgp_server_id: String,
+}
+
+/// SGP 请求用到的两个 token。
+///
+/// LCU 重启或长时间运行后都会失效，所以不存成裸字段，
+/// 而是放进锁里支持原地刷新。读多写极少（只在 401 时写），
+/// 用 `RwLock` 足够，且临界区里没有 `.await`。
+struct SgpTokens {
     access_token: String,
     league_session_token: String,
-    sgp_server_id: String,
 }
 
 impl SgpClient {
@@ -43,9 +55,19 @@ impl SgpClient {
             .league_session_token()
             .await
             .unwrap_or_else(|_| access_token.clone());
+        // 显式开压缩。reqwest 在编译期启用对应 feature 后，
+        // `Accepts::default()` 本来就会把 gzip/brotli/deflate 设为 true，
+        // 这里写出来是为了**把这个依赖摆在明面上**：
+        // SGP 的 SUMMARY 一页 50 局未压缩 6.58 MB，gzip 后 0.44 MB。
+        // 一旦有人误删 Cargo.toml 里的压缩 feature，这几个方法会直接
+        // 编译失败，而不是悄悄退化成全量下载（那正是之前的故障形态：
+        // 并发开到 32 也只有 2 req/s，因为瓶颈在带宽而不在请求数）。
         let http = Client::builder()
             .danger_accept_invalid_certs(true)
             .no_proxy()
+            .gzip(true)
+            .brotli(true)
+            .deflate(true)
             .timeout(std::time::Duration::from_secs(14))
             .build()
             .map_err(AppError::Http)?;
@@ -53,10 +75,87 @@ impl SgpClient {
         Ok(Self {
             http,
             base_url: base_url.to_string(),
-            access_token,
-            league_session_token,
+            lcu: lcu.clone(),
+            tokens: std::sync::RwLock::new(SgpTokens {
+                access_token,
+                league_session_token,
+            }),
             sgp_server_id,
         })
+    }
+
+    /// 当前 entitlements access token。
+    fn access_token(&self) -> String {
+        self.tokens
+            .read()
+            .map(|tokens| tokens.access_token.clone())
+            .unwrap_or_default()
+    }
+
+    /// 当前 league-session token。
+    fn league_session_token(&self) -> String {
+        self.tokens
+            .read()
+            .map(|tokens| tokens.league_session_token.clone())
+            .unwrap_or_default()
+    }
+
+    /// 重新从 LCU 拉取 token 并原地替换。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 爬取一旦跑起来就是几分钟起步，中途 LCU 的 entitlements /
+    /// league-session token 会过期，表现为**突发的 401**。
+    /// 从计数器上完全看不出是过期 —— 和普通「请求失败」长得一模一样
+    /// （实测一次 86 个失败账号里就混着若干 401）。
+    /// 刷新一次即可自愈，不必把已经展开的图谱整个扔掉重来。
+    pub async fn refresh_tokens(&self) -> AppResult<()> {
+        let access_token = self.lcu.entitlements_access_token().await?;
+        let league_session_token = self
+            .lcu
+            .league_session_token()
+            .await
+            .unwrap_or_else(|_| access_token.clone());
+        if let Ok(mut tokens) = self.tokens.write() {
+            tokens.access_token = access_token;
+            tokens.league_session_token = league_session_token;
+        }
+        Ok(())
+    }
+
+    /// 带「401 自愈」的认证 GET。
+    ///
+    /// 先用当前 token 发一次；若返回 401（token 过期），刷新后原样重发一次。
+    /// 只自愈一次：真要是凭证彻底无效，刷新也救不回来，
+    /// 反复打 LCU 没有意义，还不如把错误如实抛给上层。
+    async fn get_authed(
+        &self,
+        url: String,
+        query: &[(&str, String)],
+        use_league_session: bool,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let send = |token: String| {
+            self.http
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("User-Agent", USER_AGENT)
+                .query(query)
+                .send()
+        };
+
+        let pick = |client: &Self| {
+            if use_league_session {
+                client.league_session_token()
+            } else {
+                client.access_token()
+            }
+        };
+
+        let response = send(pick(self)).await?;
+        if response.status() == StatusCode::UNAUTHORIZED && self.refresh_tokens().await.is_ok() {
+            return send(pick(self)).await;
+        }
+        Ok(response)
     }
 
     pub async fn ranked_stats(&self, puuid: &str) -> AppResult<RankedStatsResponse> {
@@ -68,7 +167,7 @@ impl SgpClient {
             ))
             .header(
                 "Authorization",
-                format!("Bearer {}", self.league_session_token),
+                format!("Bearer {}", self.league_session_token()),
             )
             .header("User-Agent", USER_AGENT)
             .send()
@@ -109,7 +208,7 @@ impl SgpClient {
             ))
             .header(
                 "Authorization",
-                format!("Bearer {}", self.league_session_token),
+                format!("Bearer {}", self.league_session_token()),
             )
             .header("User-Agent", USER_AGENT)
             .json(puuids)
@@ -138,18 +237,17 @@ impl SgpClient {
 
         for attempt in 0..=MAX_RETRIES {
             let response = self
-                .http
-                .get(format!(
-                    "{}/match-history-query/v1/products/lol/player/{}/SUMMARY",
-                    self.base_url, puuid
-                ))
-                .header("Authorization", format!("Bearer {}", self.access_token))
-                .header("User-Agent", USER_AGENT)
-                .query(&[
-                    ("startIndex", start_index.to_string()),
-                    ("count", count.to_string()),
-                ])
-                .send()
+                .get_authed(
+                    format!(
+                        "{}/match-history-query/v1/products/lol/player/{}/SUMMARY",
+                        self.base_url, puuid
+                    ),
+                    &[
+                        ("startIndex", start_index.to_string()),
+                        ("count", count.to_string()),
+                    ],
+                    false,
+                )
                 .await;
 
             let response = match response {
@@ -198,14 +296,14 @@ impl SgpClient {
             .to_ascii_uppercase();
 
         let response = self
-            .http
-            .get(format!(
-                "{}/match-history-query/v1/products/lol/{}_{}/SUMMARY",
-                self.base_url, sub_id, game_id
-            ))
-            .header("Authorization", format!("Bearer {}", self.access_token))
-            .header("User-Agent", USER_AGENT)
-            .send()
+            .get_authed(
+                format!(
+                    "{}/match-history-query/v1/products/lol/{}_{}/SUMMARY",
+                    self.base_url, sub_id, game_id
+                ),
+                &[],
+                false,
+            )
             .await?;
 
         self.parse_game_summary_response(response, game_id).await
@@ -262,58 +360,6 @@ impl SgpClient {
 
         Ok(sgp_game_json_to_lcu_game(summary))
     }
-
-    /// 查询指定账号当前是否在游戏中（SGP 观战服务 `gsm/v1/ledge/spectator`）。
-    ///
-    /// 返回 404 表示该账号当前没有进行中的对局；成功则返回双方阵容与英雄信息。
-    pub async fn active_game_by_puuid(&self, puuid: &str) -> AppResult<PlayerActiveGame> {
-        let sub_id = self
-            .sgp_server_id
-            .strip_prefix("TENCENT_")
-            .unwrap_or(&self.sgp_server_id)
-            .to_ascii_uppercase();
-
-        let request_url = format!(
-            "{}/gsm/v1/ledge/spectator/region/{}/puuid/{}",
-            self.base_url, sub_id, puuid
-        );
-
-        let send = |token: &str| {
-            self.http
-                .get(&request_url)
-                .header("Authorization", format!("Bearer {token}"))
-                .header("User-Agent", USER_AGENT)
-                .send()
-        };
-
-        let mut response = send(&self.league_session_token).await?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            // 观战接口可能只认 entitlements token，换 access_token 重试一次。
-            response = send(&self.access_token).await?;
-        }
-
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(PlayerActiveGame {
-                in_game: false,
-                game_id: None,
-                queue_config_id: None,
-                queue_type_name: None,
-                game_mode: None,
-                game_state: None,
-                teams: Vec::new(),
-            });
-        }
-
-        if !response.status().is_success() {
-            return Err(AppError::SgpUnavailable(format!(
-                "SGP 实时对局返回 {}",
-                response.status()
-            )));
-        }
-
-        let info = parse_sgp_json::<SgpActiveGame>(response, "SGP 实时对局").await?;
-        Ok(sgp_active_game_to_response(info))
-    }
 }
 
 pub async fn debug_official_api_probe(
@@ -338,7 +384,7 @@ pub async fn debug_official_api_probe(
         .get(&ranked_request_url)
         .header(
             "Authorization",
-            format!("Bearer {}", sgp.league_session_token),
+            format!("Bearer {}", sgp.league_session_token()),
         )
         .header("User-Agent", USER_AGENT)
         .send()
@@ -358,7 +404,7 @@ pub async fn debug_official_api_probe(
             "{}/match-history-query/v1/products/lol/player/{}/SUMMARY",
             sgp.base_url, summoner.puuid
         ))
-        .header("Authorization", format!("Bearer {}", sgp.access_token))
+        .header("Authorization", format!("Bearer {}", sgp.access_token()))
         .header("User-Agent", USER_AGENT)
         .query(&[
             ("startIndex", "0".to_string()),
@@ -402,7 +448,7 @@ pub async fn debug_official_api_probe(
         let summary_payload = sgp
             .http
             .get(&summary_request_url)
-            .header("Authorization", format!("Bearer {}", sgp.access_token))
+            .header("Authorization", format!("Bearer {}", sgp.access_token()))
             .header("User-Agent", USER_AGENT)
             .send()
             .await?
@@ -585,6 +631,88 @@ struct SgpObjective {
     kills: u32,
 }
 
+/// SGP 单局里每个玩家携带的挑战数据（`challenges`）。
+///
+/// **只声明我们真正读的两个键。** SGP 实测每局每人会下发约 120 个挑战项，
+/// 序列化后 3.7 KB/人、37 KB/局，占整局下载体积的 26%。
+/// 之前用 `serde_json::Value` 接，等于把 120 个键全部反序列化成 map，
+/// 解析完又只读其中 2 个键，剩下的立刻被丢掉 —— 纯浪费 CPU 和内存。
+///
+/// serde 对结构体默认「未知字段跳过」，所以只要不声明那些键，
+/// 它们就不会被分配。这是单点收益最大的一处解析优化。
+///
+/// **注意类型必须是 f64 而不是 u32**：SGP 实际下发的是
+/// `31.0` 这样的浮点值，用 u32 接会直接解析失败
+/// （实机验证时踩到过：`invalid type: floating point 31.0, expected u32`）。
+/// 老实现走 `json_value_to_u32` 做了宽松转换，这里必须保留同样的宽容度。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SgpChallenges {
+    #[serde(default)]
+    enemy_champion_immobilizations: f64,
+    #[serde(default)]
+    immobilize_and_kill_with_ally: f64,
+}
+
+/// 把挑战项里的浮点计数收敛成内部使用的 u32（负数与 NaN 归零）。
+fn challenge_count(value: f64) -> u32 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    value.round().min(u32::MAX as f64) as u32
+}
+
+/// 宽松地把 JSON 数字解析成 `u32`（负数 / 越界 / 浮点一律收敛，绝不报错）。
+///
+/// ## 为什么必须有这个
+///
+/// SGP 会在数值字段里下发 `-2147483648`（`i32::MIN`）这类哨兵值。
+/// 只要有一个字段声明成 `u32`，serde 就会**直接让整个响应解析失败** ——
+/// 而失败的单位不是「一个字段」也不是「一局」，是**整个账号的一整页**：
+/// 一个玩家身上出现一次异常值，该账号最多 50 局全部丢弃。
+///
+/// 实测代价：801 个账号里 **86 个**因此失败（约 11%），
+/// 且全部被记成「请求失败」，从计数器上完全看不出是解析问题。
+///
+/// 这已经是同一类 bug 第二次出现（上一次是 `challenges` 用 `u32` 接浮点
+/// `31.0`）。教训：**来自外部的数值字段，永远不要假设它落在类型范围内**，
+/// 能用宽松解析就别让它抛错。
+///
+/// 用 Visitor 而不是先转 `serde_json::Value`：这是热路径
+/// （每页 50 局 × 10 人 × 38 个字段 ≈ 19000 次调用），
+/// 走 Value 会多一次分配。
+fn deserialize_u32_lenient<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct LenientU32;
+
+    impl<'de> serde::de::Visitor<'de> for LenientU32 {
+        type Value = u32;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("整数或浮点数（负数与越界值一律归零）")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<u32, E> {
+            Ok(value.min(u32::MAX as u64) as u32)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<u32, E> {
+            Ok(value.clamp(0, u32::MAX as i64) as u32)
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<u32, E> {
+            if !value.is_finite() || value <= 0.0 {
+                return Ok(0);
+            }
+            Ok(value.round().min(u32::MAX as f64) as u32)
+        }
+    }
+
+    deserializer.deserialize_any(LenientU32)
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SgpParticipant {
@@ -596,155 +724,97 @@ struct SgpParticipant {
     riot_id_tagline: String,
     #[serde(default)]
     summoner_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     participant_id: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     champion_id: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     spell1_id: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     spell2_id: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     team_id: u32,
     #[serde(default)]
     win: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     kills: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     deaths: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     assists: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     turret_kills: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     gold_earned: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     total_minions_killed: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     neutral_minions_killed: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     total_damage_dealt_to_champions: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     damage_self_mitigated: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     total_damage_taken: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     total_heal: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     vision_score: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     champ_level: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     player_subteam_id: u32,
+    /// 我们只从中读 `enemyChampionImmobilizations` 和
+    /// `immobilizeAndKillWithAlly` 两个键，但**不能**用 `Value` 接：
+    /// SGP 每局每个玩家会带回来约 120 个挑战项（3.7 KB），
+    /// 10 人就是 37 KB —— 占单局下载体积的 26%，而其中 99% 是垃圾。
+    ///
+    /// 用 `ReferenceGameChallenges` 只声明这两个键，serde 会把其余的全部
+    /// 跳过（不分配、不建 map）。实测能把解析后驻留内存砍掉一大半。
     #[serde(default)]
-    challenges: Value,
-    #[serde(default)]
+    challenges: SgpChallenges,
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     item0: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     item1: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     item2: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     item3: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     item4: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     item5: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     item6: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     perk0: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     perk1: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     perk2: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     perk3: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     perk4: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     perk5: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     player_augment1: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     player_augment2: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     player_augment3: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     player_augment4: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     player_augment5: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     player_augment6: u32,
     #[serde(default)]
     lane: String,
     #[serde(default)]
     role: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SgpActiveGame {
-    #[serde(default)]
-    game: Option<SgpActiveGameDetail>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SgpActiveGameDetail {
-    #[serde(default)]
-    id: i64,
-    #[serde(default)]
-    game_state: String,
-    #[serde(default)]
-    queue_type_name: String,
-    #[serde(default)]
-    game_mode: String,
-    #[serde(default)]
-    game_queue_config_id: i32,
-    #[serde(default)]
-    team_one: Vec<SgpActivePlayer>,
-    #[serde(default)]
-    team_two: Vec<SgpActivePlayer>,
-    #[serde(default)]
-    player_champion_selections: Vec<SgpActiveSelection>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SgpActivePlayer {
-    #[serde(default)]
-    puuid: String,
-    // SGP 观战接口返回的召唤师数字 ID；当前下游以 puuid 为主键，此字段仅随反序列化保留
-    // 以备后续需要 summonerId 映射时使用，故允许 dead_code。
-    #[serde(default)]
-    #[allow(dead_code)]
-    summoner_id: i64,
-    #[serde(default)]
-    profile_icon_id: u32,
-    #[serde(default)]
-    champion_id: u32,
-    #[serde(default)]
-    summoner_name: String,
-    #[serde(default)]
-    summoner_internal_name: String,
-    #[serde(default)]
-    selected_role: String,
-    #[serde(default)]
-    selected_position: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SgpActiveSelection {
-    #[serde(default)]
-    summoner_internal_name: String,
-    #[serde(default)]
-    summoner_name: String,
-    #[serde(default)]
-    spell1_id: u32,
-    #[serde(default)]
-    spell2_id: u32,
 }
 
 async fn parse_sgp_json<T>(response: reqwest::Response, context: &str) -> AppResult<T>
@@ -783,31 +853,6 @@ fn response_preview(body: &str) -> String {
     }
 }
 
-fn challenge_u32(challenges: &Value, key: &str) -> u32 {
-    challenges
-        .get(key)
-        .and_then(json_value_to_u32)
-        .unwrap_or_default()
-}
-
-fn json_value_to_u32(value: &Value) -> Option<u32> {
-    match value {
-        Value::Number(number) => number
-            .as_u64()
-            .or_else(|| number.as_i64().and_then(|value| u64::try_from(value).ok()))
-            .or_else(|| number.as_f64().map(|value| value.max(0.0).round() as u64))
-            .and_then(|value| u32::try_from(value).ok()),
-        Value::String(value) => value.trim().parse::<u32>().ok().or_else(|| {
-            value
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .map(|value| value.max(0.0).round() as u32)
-        }),
-        _ => None,
-    }
-}
-
 fn sgp_game_json_to_lcu_game(game: SgpGameJson) -> Game {
     let identities = game
         .participants
@@ -827,10 +872,12 @@ fn sgp_game_json_to_lcu_game(game: SgpGameJson) -> Game {
         .participants
         .into_iter()
         .map(|participant| {
+            // 这两个数直接从已裁剪的 `SgpChallenges` 取，不再走 Value 查找。
+            // API 下发的是浮点，统一收敛成 u32。
             let enemy_champion_immobilizations =
-                challenge_u32(&participant.challenges, "enemyChampionImmobilizations");
+                challenge_count(participant.challenges.enemy_champion_immobilizations);
             let immobilize_and_kill_with_ally =
-                challenge_u32(&participant.challenges, "immobilizeAndKillWithAlly");
+                challenge_count(participant.challenges.immobilize_and_kill_with_ally);
 
             Participant {
                 participant_id: participant.participant_id,
@@ -916,83 +963,6 @@ fn sgp_summoner_to_lcu(summoner: SgpSummoner) -> SummonerInfo {
         summoner_level: summoner.level,
         privacy: summoner.privacy,
         ..Default::default()
-    }
-}
-
-fn sgp_active_game_to_response(info: SgpActiveGame) -> PlayerActiveGame {
-    let Some(game) = info.game else {
-        return PlayerActiveGame {
-            in_game: false,
-            game_id: None,
-            queue_config_id: None,
-            queue_type_name: None,
-            game_mode: None,
-            game_state: None,
-            teams: Vec::new(),
-        };
-    };
-
-    // 技能只出现在 playerChampionSelections 里，按召唤师内部名配对到各队成员。
-    let spells = game
-        .player_champion_selections
-        .iter()
-        .map(|selection| {
-            (
-                active_player_key(&selection.summoner_internal_name, &selection.summoner_name),
-                selection.spell1_id,
-                selection.spell2_id,
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let build_team = |players: Vec<SgpActivePlayer>, name: String| ActiveGameTeam {
-        name,
-        players: players
-            .into_iter()
-            .map(|player| {
-                let key =
-                    active_player_key(&player.summoner_internal_name, &player.summoner_name);
-                let (spell1_id, spell2_id) = spells
-                    .iter()
-                    .find(|(entry, _, _)| *entry == key)
-                    .map(|(_, spell1, spell2)| (*spell1, *spell2))
-                    .unwrap_or((0, 0));
-                ActiveGamePlayer {
-                    puuid: player.puuid,
-                    summoner_name: player.summoner_name,
-                    champion_id: player.champion_id,
-                    spell1_id,
-                    spell2_id,
-                    profile_icon_id: player.profile_icon_id,
-                    position: if player.selected_position.trim().is_empty() {
-                        player.selected_role
-                    } else {
-                        player.selected_position
-                    },
-                }
-            })
-            .collect(),
-    };
-
-    PlayerActiveGame {
-        in_game: true,
-        game_id: Some(game.id),
-        queue_config_id: Some(game.game_queue_config_id),
-        queue_type_name: Some(game.queue_type_name),
-        game_mode: Some(game.game_mode),
-        game_state: Some(game.game_state),
-        teams: vec![
-            build_team(game.team_one, "蓝方".to_string()),
-            build_team(game.team_two, "红方".to_string()),
-        ],
-    }
-}
-
-fn active_player_key(internal_name: &str, summoner_name: &str) -> String {
-    if internal_name.trim().is_empty() {
-        summoner_name.trim().to_string()
-    } else {
-        internal_name.trim().to_string()
     }
 }
 
@@ -1269,6 +1239,266 @@ mod tests {
         }
     }
 
+    /// 回归测试：SGP 单局解析必须**跳过** missions、只取 challenges 里那两个键。
+    ///
+    /// 背景：SGP 每局每人会带约 120 个挑战项 + 一大堆 `missions`，
+    /// 两者合计占单局体积的 **69.5%**（实测：missions 43.2% + challenges 26.3%），
+    /// 而我们只读其中 2 个数。
+    ///
+    /// 之前 `challenges` 用 `serde_json::Value` 接，会把 120 个键全部
+    /// 反序列化成 map 再丢掉，纯浪费 CPU/内存。这条测试锁住
+    /// 「只声明需要的键」这个约束：谁把它改回 `Value`，
+    /// 或误删 `SgpChallenges`，测试立刻失败。
+    #[test]
+    fn participant_parsing_ignores_missions_and_trims_challenges() {
+        let payload = serde_json::json!({
+            "gameId": 8969791979u64,
+            "gameCreation": 1773928417643i64,
+            "gameDuration": 1320,
+            "gameMode": "KIWI",
+            "gameType": "MATCHED_GAME",
+            "queueId": 2400,
+            "teams": [{"teamId": 100, "objectives": {"tower": {"kills": 3}}, "bans": []}],
+            "participants": [{
+                "participantId": 1,
+                "puuid": "p-1",
+                "riotIdGameName": "测试玩家",
+                "riotIdTagline": "1234",
+                "championId": 64,
+                "teamId": 100,
+                "win": true,
+                "kills": 12,
+                "deaths": 3,
+                "assists": 20,
+                "totalDamageDealtToChampions": 45678,
+                "playerAugment1": 101,
+                "playerAugment2": 202,
+                "lane": "MIDDLE",
+                "role": "SOLO",
+                // 我们不读的字段，解析时应被完整跳过。
+                "missions": {
+                    "Missions_ChampionsKilled": 12,
+                    "Missions_CreepScore": 210,
+                    "PlayerScore0": 1
+                },
+                "challenges": {
+                    // ★ 真实 API 下发的是浮点，必须用 f64 接（实机验证过）。
+                    "enemyChampionImmobilizations": 7.0,
+                    "immobilizeAndKillWithAlly": 3.0,
+                    // 一大堆与目标键同前缀/同类型的干扰项。
+                    "12AssistStreakCount": 1,
+                    "SWARM_DefeatAatrox": 0,
+                    "kda": 10.67,
+                    "immobilizeAndKillWithAllyRatio": 0.5,
+                    "enemyChampionImmobilizationsTotal": 99
+                }
+            }]
+        });
+
+        let game: SgpGameJson = serde_json::from_value(payload).expect("SGP 单局应能解析");
+        assert_eq!(game.game_id, 8969791979);
+        assert_eq!(game.queue_id, 2400);
+        assert_eq!(game.participants.len(), 1);
+
+        let p = &game.participants[0];
+        // 关键断言：两个挑战项被正确读出，干扰项不串味。
+        assert_eq!(p.challenges.enemy_champion_immobilizations, 7.0);
+        assert_eq!(p.challenges.immobilize_and_kill_with_ally, 3.0);
+
+        // 转成内部 Game 后，值仍应保留。
+        let game = sgp_game_json_to_lcu_game(game);
+        assert_eq!(game.participants[0].stats.enemy_champion_immobilizations, 7);
+        assert_eq!(game.participants[0].stats.immobilize_and_kill_with_ally, 3);
+        assert_eq!(game.participants[0].stats.kills, 12);
+        assert_eq!(game.participants[0].stats.player_augment1, 101);
+        // 参与者身份应从 participants 合成（SGP 没有 participantIdentities）。
+        assert_eq!(game.participant_identities[0].player.puuid, "p-1");
+        assert_eq!(game.participant_identities[0].player.game_name, "测试玩家");
+        assert_eq!(game.teams[0].tower_kills, 3);
+    }
+
+    /// 回归测试：挑战项缺失时不应报错（默认 0）。
+    #[test]
+    fn participant_parsing_tolerates_missing_challenges() {
+        let payload = serde_json::json!({
+            "gameId": 1,
+            "queueId": 2400,
+            "participants": [{"participantId": 1, "puuid": "x"}]
+        });
+        let game: SgpGameJson = serde_json::from_value(payload).expect("缺 challenges 也应能解析");
+        assert_eq!(game.participants[0].challenges.enemy_champion_immobilizations, 0.0);
+        assert_eq!(game.participants[0].challenges.immobilize_and_kill_with_ally, 0.0);
+    }
+
+    /// 回归测试：挑战项是浮点，必须能宽容收敛成 u32。
+    ///
+    /// 这是实机跑出来的 bug：真实 SGP 下发 `31.0`，
+    /// 一开始用 `u32` 接，直接
+    /// `invalid type: floating point '31.0', expected u32` 解析失败，
+    /// 整个对局列表都拉不回来。老实现靠 `json_value_to_u32` 兜底，
+    /// 用结构体接之后必须显式补上这层转换。
+    #[test]
+    fn challenge_count_coerces_floats_leniently() {
+        assert_eq!(challenge_count(31.0), 31);
+        assert_eq!(challenge_count(7.4), 7);
+        assert_eq!(challenge_count(7.6), 8);
+        assert_eq!(challenge_count(0.0), 0);
+        assert_eq!(challenge_count(-3.0), 0);
+        assert_eq!(challenge_count(f64::NAN), 0);
+        assert_eq!(challenge_count(f64::INFINITY), 0);
+        // 溢出保护：不应 panic，截到 u32 上限。
+        assert_eq!(challenge_count(1e30), u32::MAX);
+
+        // 端到端：真实形态的浮点 payload 必须能解析成功。
+        let payload = serde_json::json!({
+            "gameId": 2,
+            "queueId": 2400,
+            "participants": [{
+                "participantId": 1,
+                "puuid": "x",
+                "challenges": {
+                    "enemyChampionImmobilizations": 31.0,
+                    "immobilizeAndKillWithAlly": 4.0
+                }
+            }]
+        });
+        let game: SgpGameJson = serde_json::from_value(payload).expect("浮点挑战项应能解析");
+        let game = sgp_game_json_to_lcu_game(game);
+        assert_eq!(game.participants[0].stats.enemy_champion_immobilizations, 31);
+        assert_eq!(game.participants[0].stats.immobilize_and_kill_with_ally, 4);
+    }
+
+    /// 回归测试：数值字段收到负数哨兵值时，**不能**让整页对局解析失败。
+    ///
+    /// 这是实机跑出来的数据丢失 bug：SGP 在 `damageSelfMitigated` 里
+    /// 下发了 `-2147483648`（`i32::MIN`）。该字段原本声明成 `u32`，
+    /// serde 立刻抛
+    /// `invalid value: integer '-2147483648', expected u32`，
+    /// 而失败的单位是**整个账号的一整页（最多 50 局）**，
+    /// 801 个账号里有 86 个因此被白白丢弃 —— 且从计数上只显示「请求失败」，
+    /// 完全看不出是解析问题。
+    ///
+    /// 现在所有外部数值字段都走 `deserialize_u32_lenient`，
+    /// 负数/越界/浮点一律收敛，绝不抛错。这条测试锁住这个行为。
+    #[test]
+    fn participant_numeric_fields_tolerate_negative_sentinels() {
+        // 真实形态：一个字段是负数哨兵值，另一个字段正常。
+        let payload = serde_json::json!({
+            "gameId": 3,
+            "queueId": 2400,
+            "participants": [{
+                "participantId": 1,
+                "puuid": "x",
+                "damageSelfMitigated": -2147483648_i64,   // i32::MIN 哨兵
+                "totalDamageDealtToChampions": 100000,
+                "goldEarned": -1,                          // 异常负值
+                "totalMinionsKilled": 123.6,               // 浮点
+                "visionScore": 4294967296_u64              // 超 u32 上限
+            }]
+        });
+
+        // 关键：整页必须能解析成功，而不是抛错丢掉全部对局。
+        let game: SgpGameJson =
+            serde_json::from_value(payload).expect("负数哨兵值不应导致整页解析失败");
+        let p = &game.participants[0];
+
+        // 异常值收敛为 0，正常值原样保留，浮点四舍五入，越界截断。
+        assert_eq!(p.damage_self_mitigated, 0);
+        assert_eq!(p.gold_earned, 0);
+        assert_eq!(p.total_damage_dealt_to_champions, 100000);
+        assert_eq!(p.total_minions_killed, 124);
+        assert_eq!(p.vision_score, u32::MAX);
+    }
+
+    /// 端到端：带负数哨兵值的整局仍应转成内部 `Game`（不丢参与者）。
+    #[test]
+    fn negative_sentinel_does_not_drop_participants() {
+        let payload = serde_json::json!({
+            "gameId": 4,
+            "queueId": 2400,
+            "participants": [{
+                "participantId": 1,
+                "puuid": "p-neg",
+                "riotIdGameName": "负值玩家",
+                "damageSelfMitigated": -2147483648_i64,
+                "championId": 101
+            }]
+        });
+        let game: SgpGameJson = serde_json::from_value(payload).expect("应能解析");
+        let game = sgp_game_json_to_lcu_game(game);
+        assert_eq!(game.participants.len(), 1, "参与者不应被丢弃");
+        assert_eq!(game.participants[0].stats.damage_self_mitigated, 0);
+        assert_eq!(game.participants[0].champion_id, 101);
+    }
+
+    /// 实机验证：用真实 `SgpClient` 拉一页，确认压缩确实生效且能解析。
+    ///
+    /// 这条测试需要本机已启动并登录国服客户端，所以默认 `#[ignore]`。
+    /// 用它来复核「查半天只回来两个对局」是否真的被治好：
+    /// ```text
+    /// cargo test --lib manual_verify_sgp_compressed_fetch -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "手动触发：需要本机已登录的国服客户端"]
+    async fn manual_verify_sgp_compressed_fetch() {
+        use std::time::Instant;
+
+        let auth = discover_primary_client().expect("应能找到已登录客户端");
+        let lcu = LcuClient::new(&auth).expect("应能创建 LCU 客户端");
+        let summoner = lcu.current_summoner().await.expect("应能读取当前召唤师");
+        let sgp = SgpClient::new(&lcu, &auth, None)
+            .await
+            .expect("应能创建 SGP 客户端");
+
+        let puuid = summoner.puuid.clone();
+        let started = Instant::now();
+        let games = sgp
+            .match_history(&puuid, 0, 50)
+            .await
+            .expect("应能拉到对局列表");
+        let elapsed = started.elapsed();
+
+        println!(
+            "compressed fetch => {} 局 / {:?} / 平均 {:.1} ms/局",
+            games.len(),
+            elapsed,
+            elapsed.as_millis() as f64 / games.len().max(1) as f64
+        );
+
+        assert!(!games.is_empty(), "应至少拉到一局");
+        // 解析出来的对局必须带着参与者身份（爬取引擎靠它扩散）。
+        let with_players = games
+            .iter()
+            .filter(|game| !game.participant_identities.is_empty())
+            .count();
+        println!("其中带参与者身份的对局: {with_players}/{}", games.len());
+        assert!(with_players > 0, "对局应带出参与者身份，否则图谱无法扩散");
+    }
+
+    /// 回归测试：SGP HTTP 客户端必须开启压缩。
+    ///
+    /// 实测 SGP 一页 50 局未压缩 **6.58 MB**，gzip 后仅 **0.44 MB**，
+    /// 耗时从 ~2200 ms 降到 ~595 ms。此前 `reqwest` 只开了
+    /// `json` + `rustls-tls`，**根本不发 Accept-Encoding**，
+    /// 每页实打实下载 6.5 MB —— 这就是「查半天只回来两个对局」的真凶
+    /// （并发加到 32 也只有 2 req/s，瓶颈是带宽不是请求数）。
+    ///
+    /// 这条测试锁住 Cargo.toml 里的 gzip/brotli/deflate feature。
+    #[test]
+    fn reqwest_client_compression_features_enabled() {
+        // 能调用 .gzip()/.brotli()/.deflate() 本身就证明 feature 已开启
+        // （feature 缺失时这些方法不存在，编译直接失败）。
+        let client = Client::builder()
+            .danger_accept_invalid_certs(true)
+            .no_proxy()
+            .gzip(true)
+            .brotli(true)
+            .deflate(true)
+            .build()
+            .expect("应能创建启用压缩的 HTTP client");
+        drop(client);
+    }
+
     #[tokio::test]
     #[ignore = "手动触发：探测官方对局/段位接口里是否存在 ELO 或近似字段"]
     async fn manual_probe_official_rank_like_fields() {
@@ -1307,7 +1537,7 @@ mod tests {
                 "{}/match-history-query/v1/products/lol/{}_{}/SUMMARY",
                 sgp.base_url, sub_id, game.game_id
             ))
-            .header("Authorization", format!("Bearer {}", sgp.access_token))
+            .header("Authorization", format!("Bearer {}", sgp.access_token()))
             .header("User-Agent", USER_AGENT)
             .send()
             .await

@@ -87,8 +87,7 @@ const progress = ref({ done: 0, total: 0, matched: 0 })
 const statusMessage = ref("")
 const errorText = ref("")
 
-type MatchHit = {
-  game: RecentGame
+type MatchHit = {  game: RecentGame
   firstAugmentId: number
   /** 命中所在队伍名（蓝方/红方…） */
   teamName: string

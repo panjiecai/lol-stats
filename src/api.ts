@@ -8,7 +8,6 @@ import type {
   GameAssetBundle,
   LiveGameResponse,
   MatchDetailResponse,
-  PlayerActiveGame,
   ExternalEloLookupDebugResponse,
   OfficialApiDebugResponse,
   PlayerEloEstimateResponse,
@@ -155,6 +154,10 @@ export function copyPngToClipboard(bytes: number[]) {
   return invoke<void>("copy_png_to_clipboard", { bytes })
 }
 
+export function runExternalCommand(command: string) {
+  return invoke<void>("run_external_command", { command })
+}
+
 export function loadMatchDetail(gameId: number, sgpServerId?: string) {
   return invoke<MatchDetailResponse>("load_match_detail", { gameId, sgpServerId })
 }
@@ -232,8 +235,4 @@ export function debugOfficialApi() {
 
 export function loadLiveGame(depth: number) {
   return invoke<LiveGameResponse>("load_live_game", { depth })
-}
-
-export function queryPlayerActiveGame(puuid: string, sgpServerId?: string) {
-  return invoke<PlayerActiveGame>("query_player_active_game", { puuid, sgpServerId })
 }

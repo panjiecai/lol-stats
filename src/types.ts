@@ -413,31 +413,6 @@ export interface LiveGameResponse {
   teams: LiveTeam[]
 }
 
-export interface ActiveGamePlayer {
-  puuid: string
-  summonerName: string
-  championId: number
-  spell1Id: number
-  spell2Id: number
-  profileIconId: number
-  position: string
-}
-
-export interface ActiveGameTeam {
-  name: string
-  players: ActiveGamePlayer[]
-}
-
-export interface PlayerActiveGame {
-  inGame: boolean
-  gameId?: number
-  queueConfigId?: number
-  queueTypeName?: string
-  gameMode?: string
-  gameState?: string
-  teams: ActiveGameTeam[]
-}
-
 export interface ChampionSummaryItem {
   id: number
   name: string

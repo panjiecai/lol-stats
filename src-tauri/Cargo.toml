@@ -1,6 +1,6 @@
 [package]
 name = "lol-stats"
-version = "0.7.0"
+version = "0.7.3"
 description = "国服英雄联盟战绩统计工具"
 authors = ["local"]
 edition = "2021"
@@ -30,7 +30,18 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 md5 = "0.7"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `gzip` + `brotli` 是**必须**的，不是可选优化：
+# SGP 的 match-history SUMMARY 一页 50 局未压缩约 6.5 MB，
+# 开启压缩后只有 0.4 MB（15 倍差距）。
+# 之前只开 json+rustls-tls，reqwest 根本不会发 Accept-Encoding，
+# 于是每一页都实打实下载 6.5 MB —— 这才是「查半天才回来两个对局」的真凶。
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "rustls-tls",
+  "gzip",
+  "brotli",
+  "deflate",
+] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sysinfo = "0.33"
 thiserror = "2"

@@ -13,6 +13,7 @@ import type {
 } from "../types"
 import { mitigationValue, riotId, teamMitigationValue } from "../utils"
 import {
+  clampStatsDepth,
   MAX_STATS_DEPTH,
   STATS_DEPTH_OPTIONS,
 } from "../statsDepth"
@@ -233,7 +234,8 @@ function ensureStatsCoverage() {
 }
 
 function commitStatsDepth() {
-  const nextDepth = clampStatsDepth(statsDepthInput.value)
+  // 用共享的 clamp：允许 1~3000 的任意自定义场次（不再被抬到 50）
+  const nextDepth = clampStatsDepth(statsDepthInput.value, props.statsDepth)
   statsDepthInput.value = String(nextDepth)
   statsDepthPickerOpen.value = false
   if (nextDepth !== props.statsDepth) {
@@ -353,12 +355,6 @@ function refreshActiveTab() {
 function queueCount(option: QueueOption) {
   if (!props.fullStats) return null
   return props.fullStats.recentGames.filter(option.matches).length
-}
-
-function clampStatsDepth(value: unknown) {
-  const numberValue = Number(value)
-  if (!Number.isFinite(numberValue)) return props.statsDepth
-  return Math.min(MAX_STATS_DEPTH, Math.max(50, Math.round(numberValue)))
 }
 
 function buildFilteredStats(
@@ -568,6 +564,7 @@ function round2(value: number) {
             </div>
             <label
               class="stats-depth-control"
+              :title="`统计口径的对局数量上限，可自定义 1~${MAX_STATS_DEPTH}（回车或点击空白处生效）`"
               @focusin="openStatsDepthPicker"
               @focusout="scheduleStatsDepthPickerClose"
             >
@@ -579,6 +576,7 @@ function round2(value: number) {
                 pattern="[0-9]*"
                 autocomplete="off"
                 spellcheck="false"
+                placeholder="自定义"
                 :disabled="loading"
                 @click="openStatsDepthPicker"
                 @input="normalizeStatsDepthInput"

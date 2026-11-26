@@ -1,22 +1,24 @@
 <script setup lang="ts">
-import { computed, inject, nextTick, onBeforeUnmount, ref, watch } from "vue"
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { BellRing, ClipboardCopy, LoaderCircle, RadioTower } from "lucide-vue-next"
-import { loadMatchDetail, loadSelfStats, searchPlayer } from "../api"
-import { copyElementAsPng } from "../imageShare"
+import { loadSelfStats, searchPlayer } from "../api"
+import { dispatchRpaNotify, EXPORT_RECENT_DEPTH, useMatchExport } from "../matchExport"
 import { notifyKey } from "../notifications"
-import type {
-  ChampionSummaryItem,
-  GameAssetBundle,
-  MatchDetailResponse,
-  RecentGame,
-} from "../types"
-import { riotId } from "../utils"
+import { rpaNotifyReady } from "../rpaNotify"
+import type { ChampionSummaryItem, GameAssetBundle, RecentGame, SummonerInfo } from "../types"
 import MatchOverviewPanel from "./MatchOverviewPanel.vue"
 
-const RECENT_DEPTH = 20
+const RECENT_DEPTH = EXPORT_RECENT_DEPTH
 const POLL_INTERVAL_MS = 3000
-const EXPORT_RENDER_WAIT_MS = 250
 const POLL_INTERVAL_TEXT = `${POLL_INTERVAL_MS / 1000} 秒`
+/**
+ * 看门狗：单次检查正常几秒内就该返回，超过这个时长说明底层请求卡住了
+ * （IPC 挂起 / SGP 无响应）。这时强行放行下一轮，避免整个轮询被一次
+ * 挂死的请求永久堵住 —— 这正是「明明有新战绩却不动，要停止再启动」的成因之一。
+ */
+const POLL_BUSY_TIMEOUT_MS = 25_000
+/** 同一局导出连续失败这么多次就放弃重试并推进基线，避免卡在同一局空转 */
+const MAX_EXPORT_ATTEMPTS = 3
 
 const props = defineProps<{
   accountQuery?: string
@@ -28,19 +30,29 @@ const props = defineProps<{
 
 const notify = inject(notifyKey, () => 0)
 
-const exporting = ref(false)
-const exportStage = ref<HTMLElement | null>(null)
-const exportGame = ref<RecentGame | null>(null)
-const exportDetail = ref<MatchDetailResponse | null>(null)
-const exportTeamId = ref<number | undefined>(undefined)
-const exportOwnerLabel = ref("")
-const exportOwnerPuuid = ref("")
+const {
+  exporting,
+  exportGame,
+  exportDetail,
+  exportTeamId,
+  exportOwnerLabel,
+  exportOwnerPuuid,
+  exportMatch,
+  bindStage,
+} = useMatchExport()
 
 const pollingActive = ref(false)
 const pollingBusy = ref(false)
+const lastCheckAt = ref(0)
 let pollTimer = 0
 let lastSeenGameId: number | null = null
 let lastSeenCreation = 0
+/** 上一次真正发起检查的时刻，用于识别后台节流 / 系统休眠造成的「很久没跑」 */
+let lastTickAt = 0
+let busySince = 0
+/** 正在等待重试的那一局 */
+let pendingGameId: number | null = null
+let pendingAttempts = 0
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
@@ -55,75 +67,63 @@ function latestGameOf(forceRefresh = false) {
 }
 
 const canOperate = computed(() => props.isSelf || Boolean(props.accountQuery))
-const pollHint = computed(
-  () => `每 ${POLL_INTERVAL_TEXT}检查该账号是否打了新对局，发现后自动复制图片`,
-)
+const pollHint = computed(() => {
+  const base = `每 ${POLL_INTERVAL_TEXT}检查该账号是否打了新对局，发现后自动复制图片`
+  return rpaNotifyReady() ? `${base}并发到微信` : base
+})
 
-async function exportLatestMatch(detected = false) {
+const lastCheckText = computed(() => {
+  if (!lastCheckAt.value) return "尚未检查"
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(lastCheckAt.value))
+})
+
+const pollButtonTitle = computed(() => {
+  if (!pollingActive.value) return pollHint.value
+  return `停止每 ${POLL_INTERVAL_TEXT}轮询（上次检查 ${lastCheckText.value}）`
+})
+
+/**
+ * 导出该账号最新一局（或轮询刚发现的这一局）的己方详情图。
+ * 轮询命中时把已经拿到的对局信息传进来，省掉一次重复请求。
+ */
+async function exportLatestMatch(
+  detected = false,
+  known?: { game?: RecentGame; summoner?: SummonerInfo },
+) {
   if (exporting.value) return false
 
-  exporting.value = true
-  try {
-    const stats = await latestGameOf(true)
-    const summoner = stats.summoner
-    const latest = stats.recentGames?.[0]
-    if (!summoner || !latest) {
-      notify({ kind: "error", title: "暂时没有战绩", message: "请确认该账号有对局记录" })
-      return false
-    }
+  const outcome = await exportMatch(
+    {
+      query: props.accountQuery,
+      sgpServerId: props.sgpServerId,
+      isSelf: props.isSelf,
+      depth: RECENT_DEPTH,
+    },
+    { known },
+  )
 
-    const detail = await loadMatchDetail(latest.gameId, props.sgpServerId)
-    const ownerTeam = detail.teams.find((team) =>
-      team.players.some((player) => player.puuid === summoner.puuid),
-    )
-    if (!ownerTeam) {
-      notify({ kind: "error", title: "导出失败", message: "无法在该对局中找到此账号" })
-      return false
-    }
-
-    exportGame.value = latest
-    exportDetail.value = detail
-    exportTeamId.value = ownerTeam.teamId
-    exportOwnerLabel.value = riotId(summoner)
-    exportOwnerPuuid.value = summoner.puuid
-    await nextTick()
-    await document.fonts?.ready
-    await new Promise((resolve) => window.setTimeout(resolve, EXPORT_RENDER_WAIT_MS))
-
-    const target = exportStage.value
-    if (!target) throw new Error("导出区域未渲染")
-
-    const size = await copyElementAsPng(target, {
-      backgroundColor: "#f6faf9",
-      pixelRatio: 2,
-      filter: (node) => !(node instanceof HTMLElement && node.classList.contains("overview-actions")),
-    })
-
-    // 截图完成立即隐藏覆盖层，避免遮挡界面
-    exportGame.value = null
-    exportDetail.value = null
-    exportTeamId.value = undefined
-    await nextTick()
-
-    notify({
-      kind: "success",
-      title: detected ? "发现新对局，图片已复制" : "最新对局图片已复制",
-      message: size
-        ? `己方详情已复制（${size.width}×${size.height}），可直接粘贴`
-        : "己方详情已复制，可直接粘贴",
-    })
-    return true
-  } catch (error) {
+  if (!outcome.ok) {
     notify({
       kind: "error",
       title: "导出图片失败",
-      message: errorMessage(error),
+      message: outcome.message,
       duration: 7000,
     })
     return false
-  } finally {
-    exporting.value = false
   }
+
+  // 截图已进剪贴板，交给影刀发到微信；这一步失败不影响导出结果
+  const rpaText = await dispatchRpaNotify(notify)
+  notify({
+    kind: "success",
+    title: detected ? "发现新对局，图片已复制" : "最新对局图片已复制",
+    message: `${outcome.message}${rpaText}，可直接粘贴`,
+  })
+  return true
 }
 
 function togglePolling() {
@@ -142,6 +142,7 @@ async function startPolling() {
   }
 
   pollingBusy.value = true
+  busySince = Date.now()
   try {
     const stats = await latestGameOf(true)
     const first = stats.recentGames?.[0]
@@ -159,35 +160,79 @@ async function startPolling() {
     pollingBusy.value = false
   }
 
+  pendingGameId = null
+  pendingAttempts = 0
+  lastTickAt = Date.now()
+  lastCheckAt.value = lastTickAt
   pollingActive.value = true
   notify({
     kind: "info",
     title: "轮询已开启",
     message: `每 ${POLL_INTERVAL_TEXT}检查一次最新战绩，发现新对局会自动复制图片`,
   })
-  pollTimer = window.setInterval(() => {
+  schedulePoll()
+}
+
+/**
+ * 下一轮延迟：正常按固定周期排；如果距上次检查已经超过两个周期
+ * （窗口被后台节流、系统休眠），立刻补一次，不让轮询「装死」。
+ */
+function pollDelay() {
+  if (!lastTickAt) return POLL_INTERVAL_MS
+  const elapsed = Date.now() - lastTickAt
+  if (elapsed > POLL_INTERVAL_MS * 2) return 0
+  return Math.max(0, POLL_INTERVAL_MS - elapsed)
+}
+
+function schedulePoll() {
+  if (!pollingActive.value) return
+  window.clearTimeout(pollTimer)
+  pollTimer = window.setTimeout(() => {
     void pollTick()
-  }, POLL_INTERVAL_MS)
+  }, pollDelay())
 }
 
 async function pollTick() {
-  if (pollingBusy.value) return
+  if (!pollingActive.value) return
+  lastTickAt = Date.now()
+
+  // 上一轮还卡着且没超时 → 顺延一轮；超时就当卡死，强行放行
+  if (pollingBusy.value && Date.now() - busySince < POLL_BUSY_TIMEOUT_MS) {
+    schedulePoll()
+    return
+  }
+
   pollingBusy.value = true
+  busySince = Date.now()
   try {
     if (exporting.value) return
+
     const stats = await latestGameOf(true)
     const first = stats.recentGames?.[0]
     if (!first) return
-    const isNew = first.gameId !== lastSeenGameId && first.gameCreation >= lastSeenCreation
-    if (!isNew) return
+    if (first.gameId === lastSeenGameId) return
+    if (first.gameCreation < lastSeenCreation) return
 
-    lastSeenGameId = first.gameId
-    lastSeenCreation = first.gameCreation
-    await exportLatestMatch(true)
+    if (pendingGameId !== first.gameId) {
+      pendingGameId = first.gameId
+      pendingAttempts = 0
+    }
+    pendingAttempts += 1
+
+    // 基线只在导出成功（或重试到上限）后推进：失败不丢帧，下一轮还能补上
+    const ok = await exportLatestMatch(true, { game: first, summoner: stats.summoner })
+    if (ok || pendingAttempts >= MAX_EXPORT_ATTEMPTS) {
+      lastSeenGameId = first.gameId
+      lastSeenCreation = first.gameCreation
+      pendingGameId = null
+      pendingAttempts = 0
+    }
   } catch {
     // 单次轮询失败不打断定时任务，下一次继续
   } finally {
     pollingBusy.value = false
+    lastCheckAt.value = Date.now()
+    schedulePoll()
   }
 }
 
@@ -195,12 +240,35 @@ function stopPolling(options: { silent?: boolean } = {}) {
   if (!pollingActive.value && !pollTimer) return
   pollingActive.value = false
   if (pollTimer) {
-    window.clearInterval(pollTimer)
+    window.clearTimeout(pollTimer)
     pollTimer = 0
   }
   if (options.silent) return
   notify({ kind: "info", title: "轮询已停止", message: "已停止检查最新战绩" })
 }
+
+/**
+ * 窗口从后台回到前台时补检查：WebView 在窗口隐藏期间会把定时器节流到分钟级
+ * 甚至暂停，回到前台若不主动补一次，看上去就跟「卡住了」一样。
+ */
+function resumeAfterHidden() {
+  if (!pollingActive.value) return
+  if (!lastTickAt || Date.now() - lastTickAt >= POLL_INTERVAL_MS) {
+    lastTickAt = Date.now()
+    void pollTick()
+  } else {
+    schedulePoll()
+  }
+}
+
+function handleVisibilityChange() {
+  if (document.visibilityState === "visible") resumeAfterHidden()
+}
+
+onMounted(() => {
+  document.addEventListener("visibilitychange", handleVisibilityChange)
+  window.addEventListener("focus", resumeAfterHidden)
+})
 
 // 切换账号或区服时重置轮询，避免用旧账号的基线继续判断新对局。
 watch(
@@ -208,11 +276,15 @@ watch(
   () => {
     lastSeenGameId = null
     lastSeenCreation = 0
+    pendingGameId = null
+    pendingAttempts = 0
     stopPolling({ silent: true })
   },
 )
 
 onBeforeUnmount(() => {
+  document.removeEventListener("visibilitychange", handleVisibilityChange)
+  window.removeEventListener("focus", resumeAfterHidden)
   stopPolling({ silent: true })
 })
 </script>
@@ -233,7 +305,7 @@ onBeforeUnmount(() => {
       class="record-action polling"
       :class="{ active: pollingActive }"
       :disabled="!canOperate"
-      :title="pollingActive ? `停止每 ${POLL_INTERVAL_TEXT}轮询` : pollHint"
+      :title="pollButtonTitle"
       @click="togglePolling"
     >
       <RadioTower v-if="pollingActive" class="pulse" :size="14" />
@@ -244,7 +316,7 @@ onBeforeUnmount(() => {
     <Teleport to="body">
       <div
         v-if="exportGame && exportDetail"
-        ref="exportStage"
+        :ref="bindStage"
         class="export-stage"
         aria-hidden="true"
       >
@@ -336,6 +408,12 @@ onBeforeUnmount(() => {
   }
 }
 
+/*
+ * 导出舞台宽度必须装得下 MatchOverviewPanel 的紧凑列，否则 team-block 的
+ * overflow-x 会把右侧的伤害列裁掉。紧凑列 = 160 + 22 + 59 + 96 + 3 个 4px 间距 = 349，
+ * 面板 padding 12/边框 1 + team-block padding 8/边框 1 共 44 → 393，取 420 留余量。
+ * （与 src/matchExport.ts 的 EXPORT_STAGE_WIDTH 保持一致）
+ */
 .export-stage {
   position: fixed;
   left: 0;
